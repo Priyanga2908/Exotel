@@ -219,7 +219,41 @@
 require("dotenv").config();
 
 const fs = require("fs");
+const path = require("path");
 const WebSocket = require("ws");
+
+class CallLogger {
+  constructor(sessionId) {
+    this.sessionId = sessionId;
+    this.logsDir = path.join(__dirname, "logs");
+    this.filePath = path.join(this.logsDir, `call_${sessionId}.log`);
+    
+    // Ensure logs directory exists
+    if (!fs.existsSync(this.logsDir)) {
+      fs.mkdirSync(this.logsDir, { recursive: true });
+    }
+    
+    this.stream = fs.createWriteStream(this.filePath, { flags: 'a' });
+  }
+
+  log(msg) {
+    const timestamp = new Date().toISOString();
+    this.stream.write(`[${timestamp}] ${msg}\n`);
+  }
+
+  error(msg, err) {
+    const timestamp = new Date().toISOString();
+    if (err) {
+      this.stream.write(`[${timestamp}] ERROR: ${msg} - ${err.stack || err.message || err}\n`);
+    } else {
+      this.stream.write(`[${timestamp}] ERROR: ${msg}\n`);
+    }
+  }
+
+  end() {
+    this.stream.end();
+  }
+}
 const {
   TranscribeStreamingClient,
   StartStreamTranscriptionCommand,
@@ -251,33 +285,36 @@ function shouldProcessTranscription(text) {
   if (!text) return false;
   
   // Normalize: lower case and trim
-  const cleanText = text.toLowerCase().trim();
+  let cleanText = text.toLowerCase().trim();
   if (cleanText.length === 0) return false;
 
-  // List of filler words/noises in both English transcripts and Kannada transcripts
-  const fillers = [
-    "aaah", "uhhh", "ummm", "huh", "ohh", "ah", "uh", "um", "oh",
-    "ಆಹ್", "ಉಹ್", "ಓಹ್", "ಹೌದು", "ಹಾ", "ಹಂ", "ಹ್ಮ್"
+  // Remove punctuation
+  cleanText = cleanText.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, "").trim();
+
+  // List of filler words/noises/greetings to filter out
+  const unwantedPhrases = [
+    "good morning", "good afternoon", "good evening", "thank you so much", "thank you very much", "thank you",
+    "hello", "hi", "welcome", "thanks", "aaah", "uhhh", "ummm", "huh", "ohh", "ah", "uh", "um", "oh",
+    "ನಮಸ್ಕಾರ", "ಹಲೋ", "ಶುಭೋದಯ", "ಧನ್ಯವಾದ", "ಸ್ವಾಗತ", "ಶುಭ ಮಧ್ಯಾಹ್ನ", "ಶುಭ ಸಂಜೆ",
+    "ಆಹ್", "ಉಹ್", "ಓಹ್", "ಹೌದು", "ಹಾ", "ಹಂ", "ಹ್ಮ್", "ಥ್ಯಾಂಕ್ ಯೂ", "ಥ್ಯಾಂಕ್ಸ್"
   ];
 
-  // List of common greetings in both English transcripts and Kannada transcripts
-  const greetings = [
-    "hello", "hi", "good morning", "thank you", "welcome", "thanks", "good afternoon", "good evening",
-    "ನಮಸ್ಕಾರ", "ಹಲೋ", "ಶುಭೋದಯ", "ಧನ್ಯವಾದ", "ಸ್ವಾಗತ", "ಶುಭ ಮಧ್ಯಾಹ್ನ", "ಶುಭ ಸಂಜೆ"
-  ];
+  // Remove all unwanted phrases from the clean text
+  let remainingText = cleanText;
+  for (const phrase of unwantedPhrases) {
+    // Replace with word boundary for English words to avoid partial matching
+    const regex = new RegExp(`\\b${phrase}\\b`, 'g');
+    remainingText = remainingText.replace(regex, "");
+    
+    // Also do a simple string split/join for non-ASCII Kannada characters since \b doesn't apply to them
+    remainingText = remainingText.split(phrase).join("");
+  }
 
-  // Remove punctuation for clean matching
-  const wordClean = cleanText.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, "").trim();
+  // Clean remaining text (replace multiple spaces with a single space)
+  remainingText = remainingText.replace(/\s+/g, " ").trim();
 
-  // If the text is empty after removing punctuation, ignore it
-  if (wordClean.length === 0) return false;
-
-  // Split into words
-  const words = wordClean.split(/\s+/);
-  
-  // Check if every word in the transcript is either a filler or a greeting
-  const onlyUnwanted = words.every(word => fillers.includes(word) || greetings.includes(word));
-  if (onlyUnwanted) {
+  // If there is no meaningful content left, ignore it
+  if (remainingText.length === 0) {
     return false;
   }
 
@@ -341,15 +378,25 @@ ${text}
     );
 
     const contentText = responseBody.content[0].text.trim();
-    // Parse the JSON output
+    // Strip markdown code block formatting if present
+    let jsonText = contentText;
+    if (jsonText.startsWith("```")) {
+      jsonText = jsonText.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "").trim();
+    }
+
     try {
-      return JSON.parse(contentText);
+      return JSON.parse(jsonText);
     } catch (parseErr) {
-      console.warn("Failed to parse JSON response from Bedrock. Attempting to extract JSON.");
-      const jsonMatch = contentText.match(/\{[\s\S]*\}/);
+      const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
-        return JSON.parse(jsonMatch[0]);
+        try {
+          return JSON.parse(jsonMatch[0]);
+        } catch (regexErr) {
+          console.error("Failed to parse JSON from Bedrock response:", contentText);
+          throw regexErr;
+        }
       }
+      console.error("Failed to parse JSON from Bedrock response:", contentText);
       throw parseErr;
     }
 
@@ -360,12 +407,12 @@ ${text}
   }
 }
 
-async function startTranscribe(audioStreamGenerator, sampleRateHertz) {
+async function startTranscribe(audioStreamGenerator, sampleRateHertz, logger) {
   try {
-    console.log(`🎛️  Starting Transcribe with MediaSampleRateHertz=${sampleRateHertz}`);
+    if (logger) logger.log(`🎛️  Starting Transcribe with MediaSampleRateHertz=${sampleRateHertz}`);
 
     const command = new StartStreamTranscriptionCommand({
-    LanguageCode: "kn-IN",
+      LanguageCode: "kn-IN",
       MediaEncoding: "pcm",
       MediaSampleRateHertz: sampleRateHertz,
       AudioStream: audioStreamGenerator,
@@ -373,8 +420,7 @@ async function startTranscribe(audioStreamGenerator, sampleRateHertz) {
 
     const response = await client.send(command);
 
-
-    console.log("🎙️ Transcribe started...");
+    if (logger) logger.log("🎙️ Transcribe started...");
 
     for await (const event of response.TranscriptResultStream) {
       if (event.TranscriptEvent) {
@@ -383,36 +429,52 @@ async function startTranscribe(audioStreamGenerator, sampleRateHertz) {
         for (const r of results) {
           const text = r.Alternatives[0].Transcript;
 
-          if (r.IsPartial)
-            console.log("PARTIAL:", text);
-            
-          else
-          {
-             console.log("FINAL (KN):", text);
+          if (r.IsPartial) {
+            if (logger) logger.log(`PARTIAL: ${text}`);
+          } else {
+            if (logger) logger.log(`FINAL (KN): ${text}`);
 
-             if (!shouldProcessTranscription(text)) {
-               console.log("FILTERED (IGNORED GREETING/FILLER/SILENCE)");
-             } else {
-               const result = await translateAndProcessQuery(text);
-               if (result) {
-                 console.log("ENGLISH TRANSLATION:", result.translation);
-                 if (result.answer) {
-                   console.log("SUPPORT ANSWER:", result.answer);
-                 } else {
-                   console.log("SUPPORT ANSWER: (Not a support query)");
-                 }
-               }
-             }
+            if (!shouldProcessTranscription(text)) {
+              if (logger) logger.log("FILTERED (IGNORED GREETING/FILLER/SILENCE)");
+            } else {
+              if (logger) logger.log(`PROCESSING THROUGH CLAUDE: ${text}`);
+              const result = await translateAndProcessQuery(text);
+              if (result) {
+                if (logger) logger.log(`ENGLISH TRANSLATION: ${result.translation}`);
+                if (result.answer) {
+                  if (logger) logger.log(`SUPPORT ANSWER: ${result.answer}`);
+                } else {
+                  if (logger) logger.log("SUPPORT ANSWER: (Not a support query)");
+                }
+
+                // Clean console output for the support team
+                console.log("\n==================================================");
+                console.log(`FINAL (KN):          ${text}`);
+                console.log(`ENGLISH TRANSLATION: ${result.translation}`);
+                if (result.answer) {
+                  console.log(`SUPPORT ANSWER:      ${result.answer}`);
+                } else {
+                  console.log(`SUPPORT ANSWER:      (Not a support query)`);
+                }
+                console.log("==================================================\n");
+              }
+            }
           }
         }
         
       }
     }
 
-    console.log("Transcribe stream closed");
+    if (logger) logger.log("Transcribe stream closed");
   } catch (err) {
-    console.error("TRANSCRIBE ERROR:");
-    console.dir(err, { depth: null });
+    if (logger) {
+      logger.error("TRANSCRIBE ERROR", err);
+    } else {
+      console.error("TRANSCRIBE ERROR:");
+      console.dir(err, { depth: null });
+    }
+  } finally {
+    if (logger) logger.end();
   }
 }
 
@@ -420,11 +482,10 @@ const wss = new WebSocket.Server({ port: PORT });
 const audioFile = fs.createWriteStream("audio.raw");
 wss.on("connection", (ws) => {
 
-  console.log("📞 Call connected");
-
   let audioQueue = [];
   let streamEnded = false;
   let transcribeStarted = false; // guards against starting Transcribe more than once
+  let logger = null;
 
   async function* audioStream() {
     while (true) {
@@ -438,7 +499,7 @@ wss.on("connection", (ws) => {
         };
 
       } else if (streamEnded) {
-        console.log("Audio stream ended");
+        if (logger) logger.log("Audio stream ended");
         return;
       } else {
         await new Promise((r) => setTimeout(r, 50));
@@ -447,41 +508,43 @@ wss.on("connection", (ws) => {
     }
   }
 
-  // NOTE: startTranscribe() is no longer called immediately on connection.
-  // It now waits for the "start" event below, since that's where we learn
-  // the real sample rate to pass to Transcribe.
-
   ws.on("message", (msg) => {
 
     try {
 
       const data = JSON.parse(msg.toString());
-      console.log("Received event:", data.event);//fr testing
+      const streamSid = data.streamSid || data.stream_sid || `session_${Date.now()}`;
+
+      if (!logger) {
+        logger = new CallLogger(streamSid);
+        logger.log(`📞 WebSocket connection established for stream: ${streamSid}`);
+        console.log(`📞 Call connected (Stream SID: ${streamSid}). Logs saved to logs/call_${streamSid}.log`);
+      }
+
+      logger.log(`Received event: ${data.event}`);
 
       switch (data.event) {
         case "connected":
-          console.log("Connected event received");
+          logger.log("Connected event received");
           break;
         case "start": {
-          console.log("Start event received");
-          console.log(JSON.stringify(data, null, 2));
+          logger.log("Start event received");
+          logger.log(JSON.stringify(data, null, 2));
 
-          // Pull sample rate from Exotel's mediaFormat block. Fall back to
-          // 8000 (Exotel's typical default) only if it's missing, and log
-          // loudly so a missing field doesn't go unnoticed.
-          const mediaFormat = data.start && data.start.media_format;
+          // Pull sample rate from Exotel's mediaFormat block (handling both camelCase and snake_case).
+          const mediaFormat = data.start && (data.start.mediaFormat || data.start.media_format);
           let sampleRateHertz = mediaFormat && (mediaFormat.sampleRate || mediaFormat.sample_rate);
 
           if (!sampleRateHertz) {
-            console.warn("⚠️  No sampleRate found in start event mediaFormat — defaulting to 8000Hz");
+            logger.log("⚠️  No sampleRate found in start event mediaFormat — defaulting to 8000Hz");
             sampleRateHertz = 8000;
           }
 
-          console.log("🔍 Using MediaSampleRateHertz:", sampleRateHertz);
+          logger.log(`🔍 Using MediaSampleRateHertz: ${sampleRateHertz}`);
 
           if (!transcribeStarted) {
             transcribeStarted = true;
-            startTranscribe(audioStream(), sampleRateHertz);
+            startTranscribe(audioStream(), sampleRateHertz, logger);
           }
 
           break;
@@ -495,43 +558,47 @@ wss.on("connection", (ws) => {
           audioFile.write(audioBuffer);
           audioQueue.push(audioBuffer);
 
-          if (!transcribeStarted) {
-            transcribeStarted = true;
-            console.log("🚀 Media received before start event — starting Transcribe with default 8000Hz");
-            startTranscribe(audioStream(), 8000);
-          }
-
           break;
 
         case "stop":
-          console.log("Stop event received");
+          logger.log("Stop event received");
           streamEnded = true;
-           audioFile.end();
+          audioFile.end();
           break;
         default:
 
-          console.log("Unknown event:", data.event);
+          logger.log(`Unknown event: ${data.event}`);
       }
 
     } catch (err) {
 
-      console.error("Error parsing message:");
-      console.error(err);
+      if (logger) {
+        logger.error("Error parsing message", err);
+      } else {
+        console.error("Error parsing message:");
+        console.error(err);
+      }
 
     }
   });
 
   ws.on("close", () => {
 
-    console.log(" WebSocket closed");
+    if (logger) {
+      logger.log("WebSocket closed");
+    }
     streamEnded = true;
 
   });
 
   ws.on("error", (err) => {
 
-    console.error("WebSocket error:");
-    console.error(err);
+    if (logger) {
+      logger.error("WebSocket error", err);
+    } else {
+      console.error("WebSocket error:");
+      console.error(err);
+    }
     streamEnded = true;
 
   });
