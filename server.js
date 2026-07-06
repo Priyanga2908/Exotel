@@ -247,26 +247,85 @@ process.on("unhandledRejection", (reason) => {
   console.dir(reason, { depth: null });
 });
 
-async function translateKannadaToEnglish(text) {
+function shouldProcessTranscription(text) {
+  if (!text) return false;
+  
+  // Normalize: lower case and trim
+  const cleanText = text.toLowerCase().trim();
+  if (cleanText.length === 0) return false;
 
+  // List of filler words/noises in both English transcripts and Kannada transcripts
+  const fillers = [
+    "aaah", "uhhh", "ummm", "huh", "ohh", "ah", "uh", "um", "oh",
+    "ಆಹ್", "ಉಹ್", "ಓಹ್", "ಹೌದು", "ಹಾ", "ಹಂ", "ಹ್ಮ್"
+  ];
+
+  // List of common greetings in both English transcripts and Kannada transcripts
+  const greetings = [
+    "hello", "hi", "good morning", "thank you", "welcome", "thanks", "good afternoon", "good evening",
+    "ನಮಸ್ಕಾರ", "ಹಲೋ", "ಶುಭೋದಯ", "ಧನ್ಯವಾದ", "ಸ್ವಾಗತ", "ಶುಭ ಮಧ್ಯಾಹ್ನ", "ಶುಭ ಸಂಜೆ"
+  ];
+
+  // Remove punctuation for clean matching
+  const wordClean = cleanText.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, "").trim();
+
+  // If the text is empty after removing punctuation, ignore it
+  if (wordClean.length === 0) return false;
+
+  // Split into words
+  const words = wordClean.split(/\s+/);
+  
+  // Check if every word in the transcript is either a filler or a greeting
+  const onlyUnwanted = words.every(word => fillers.includes(word) || greetings.includes(word));
+  if (onlyUnwanted) {
+    return false;
+  }
+
+  return true;
+}
+
+async function translateAndProcessQuery(text) {
   try {
-
     const prompt = `
-Translate the following Kannada text into natural English.
-Treat names as names and preserve context.
-Return only the English translation.
+You are a customer support AI assistant. You will be provided with a Kannada transcript.
+Your task is to:
+1. Translate the Kannada text to English.
+2. Analyze if the text contains a customer support query or question directed to the support team.
+3. If it does contain a query, determine if it relates to any of these 10 predefined topics:
+   - Topic 1: Ticket Status (e.g. status, ticket progress) -> Answer: "Your ticket status is currently 'In Progress'. Our engineering team is active on it."
+   - Topic 2: Resolution Time (e.g. when will it be solved/fixed) -> Answer: "The estimated resolution time is within the next 2 hours."
+   - Topic 3: Assigned Agent (e.g. who is handling this, who is my agent) -> Answer: "Your assigned support agent is Rithish."
+   - Topic 4: Supervisor Escalation (e.g. speak to manager/supervisor) -> Answer: "Certainly. I can escalate this call to our supervisor, Priya, but please note she is currently on another call."
+   - Topic 5: Check Updates (e.g. how do I check progress, where to view updates) -> Answer: "You can check updates by logging into your Exotel dashboard or via the SMS link sent to your registered mobile number."
+   - Topic 6: Service Down (e.g. why is my internet/service down, outage) -> Answer: "We are experiencing a temporary fiber cut in your area, which has caused a localized outage."
+   - Topic 7: Restoration Time (e.g. when will service be restored/back online) -> Answer: "The service is expected to be restored by 4:00 PM today."
+   - Topic 8: Billing / Balance (e.g. bill amount, balance check, payment due) -> Answer: "Your outstanding bill amount is ₹450, due on the 15th of this month."
+   - Topic 9: Refund Request (e.g. refund status, refund policy, money back) -> Answer: "Refund requests are processed within 5-7 working days after validation by our billing team."
+   - Topic 10: New Ticket (e.g. raise a new ticket, file a new complaint) -> Answer: "I would be happy to raise a new ticket for you. The ticket number is #EX89230."
 
-Kannada:
+   Rule:
+   - If it matches or is semantically close to one of the topics above, return the exact Answer specified.
+   - If it is a customer support query/question but does NOT relate to any of the 10 topics above, return: "We will check into it later. The support team will contact you."
+   - If it is NOT a support query/question (e.g., just conversational text, statement, greeting, filler), return null for the answer.
+
+Respond ONLY with a JSON object containing two keys: "translation" and "answer". Do not include any formatting, markdown wrappers, backticks, or explanation.
+Example Output:
+{
+  "translation": "Hello, when will my internet be restored?",
+  "answer": "The service is expected to be restored by 4:00 PM today."
+}
+
+Kannada Text:
 ${text}
 `;
 
     const command = new InvokeModelCommand({
-      modelId: "anthropic.claude-3-haiku-20240307-v1:0",
+      modelId: process.env.MODEL_ID || "us.anthropic.claude-haiku-4-5-20251001-v1:0",
       contentType: "application/json",
       accept: "application/json",
       body: JSON.stringify({
         anthropic_version: "bedrock-2023-05-31",
-        max_tokens: 200,
+        max_tokens: 300,
         messages: [
           {
             role: "user",
@@ -277,18 +336,26 @@ ${text}
     });
 
     const response = await bedrock.send(command);
-
     const responseBody = JSON.parse(
       Buffer.from(response.body).toString()
     );
 
-    return responseBody.content[0].text;
+    const contentText = responseBody.content[0].text.trim();
+    // Parse the JSON output
+    try {
+      return JSON.parse(contentText);
+    } catch (parseErr) {
+      console.warn("Failed to parse JSON response from Bedrock. Attempting to extract JSON.");
+      const jsonMatch = contentText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+      throw parseErr;
+    }
 
   } catch (err) {
-
-    console.error("Translation Error");
+    console.error("Translation and Query Processing Error");
     console.error(err);
-
     return null;
   }
 }
@@ -321,12 +388,23 @@ async function startTranscribe(audioStreamGenerator, sampleRateHertz) {
             
           else
           {
-          
              console.log("FINAL (KN):", text);
 
-             const english = await translateKannadaToEnglish(text);
-
-             console.log("ENGLISH:", english);} }
+             if (!shouldProcessTranscription(text)) {
+               console.log("FILTERED (IGNORED GREETING/FILLER/SILENCE)");
+             } else {
+               const result = await translateAndProcessQuery(text);
+               if (result) {
+                 console.log("ENGLISH TRANSLATION:", result.translation);
+                 if (result.answer) {
+                   console.log("SUPPORT ANSWER:", result.answer);
+                 } else {
+                   console.log("SUPPORT ANSWER: (Not a support query)");
+                 }
+               }
+             }
+          }
+        }
         
       }
     }
