@@ -492,8 +492,14 @@ wss.on("connection", (ws) => {
             data.media.payload,
             "base64"
           );
-           audioFile.write(audioBuffer);
+          audioFile.write(audioBuffer);
           audioQueue.push(audioBuffer);
+
+          if (!transcribeStarted) {
+            transcribeStarted = true;
+            console.log("🚀 Media received before start event — starting Transcribe with default 8000Hz");
+            startTranscribe(audioStream(), 8000);
+          }
 
           break;
 
