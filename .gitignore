@@ -21,3 +21,6 @@ transcript.txt
 
 # json files
 *.json
+
+# raw files
+*.raw
