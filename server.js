@@ -3,39 +3,6 @@ require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 const WebSocket = require("ws");
-
-class CallLogger {
-  constructor(sessionId) {
-    this.sessionId = sessionId;
-    this.logsDir = path.join(__dirname, "logs");
-    this.filePath = path.join(this.logsDir, `call_${sessionId}.log`);
-    
-    // Ensure logs directory exists
-    if (!fs.existsSync(this.logsDir)) {
-      fs.mkdirSync(this.logsDir, { recursive: true });
-    }
-    
-    this.stream = fs.createWriteStream(this.filePath, { flags: 'a' });
-  }
-
-  log(msg) {
-    const timestamp = new Date().toISOString();
-    this.stream.write(`[${timestamp}] ${msg}\n`);
-  }
-
-  error(msg, err) {
-    const timestamp = new Date().toISOString();
-    if (err) {
-      this.stream.write(`[${timestamp}] ERROR: ${msg} - ${err.stack || err.message || err}\n`);
-    } else {
-      this.stream.write(`[${timestamp}] ERROR: ${msg}\n`);
-    }
-  }
-
-  end() {
-    this.stream.end();
-  }
-}
 const {
   TranscribeStreamingClient,
   StartStreamTranscriptionCommand,
@@ -65,47 +32,90 @@ process.on("unhandledRejection", (reason) => {
   console.dir(reason, { depth: null });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CallLogger — per-session file logger
+// Used by startTranscribe and finalizeCall to write structured per-call logs.
+// ─────────────────────────────────────────────────────────────────────────────
+class CallLogger {
+  constructor(sessionId) {
+    this.sessionId = sessionId;
+    this.logsDir = path.join(__dirname, "logs");
+    this.filePath = path.join(this.logsDir, `call_${sessionId}.log`);
+
+    if (!fs.existsSync(this.logsDir)) {
+      fs.mkdirSync(this.logsDir, { recursive: true });
+    }
+
+    this.stream = fs.createWriteStream(this.filePath, { flags: "a" });
+  }
+
+  log(msg) {
+    const timestamp = new Date().toISOString();
+    this.stream.write(`[${timestamp}] ${msg}\n`);
+  }
+
+  error(msg, err) {
+    const timestamp = new Date().toISOString();
+    if (err) {
+      this.stream.write(
+        `[${timestamp}] ERROR: ${msg} - ${err.stack || err.message || err}\n`
+      );
+    } else {
+      this.stream.write(`[${timestamp}] ERROR: ${msg}\n`);
+    }
+  }
+
+  end() {
+    this.stream.end();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 1 — code pre-filter 
+// Returns true  → text has meaningful content, proceed to LLM
+// Returns false → discard, store in transcript with answer=null
+// ─────────────────────────────────────────────────────────────────────────────
 function shouldProcessTranscription(text) {
   if (!text) return false;
-  
-  // Normalize: lower case and trim
+
   let cleanText = text.toLowerCase().trim();
   if (cleanText.length === 0) return false;
 
   // Remove punctuation
   cleanText = cleanText.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, "").trim();
 
-  // List of filler words/noises/greetings to filter out
   const unwantedPhrases = [
-    "good morning", "good afternoon", "good evening", "thank you so much", "thank you very much", "thank you",
-    "hello", "hi", "welcome", "thanks", "aaah", "uhhh", "ummm", "huh", "ohh", "ah", "uh", "um", "oh",
-    "ನಮಸ್ಕಾರ", "ಹಲೋ", "ಶುಭೋದಯ", "ಧನ್ಯವಾದ", "ಸ್ವಾಗತ", "ಶುಭ ಮಧ್ಯಾಹ್ನ", "ಶುಭ ಸಂಜೆ",
-    "ಆಹ್", "ಉಹ್", "ಓಹ್", "ಹೌದು", "ಹಾ", "ಹಂ", "ಹ್ಮ್", "ಥ್ಯಾಂಕ್ ಯೂ", "ಥ್ಯಾಂಕ್ಸ್"
+    "good morning", "good afternoon", "good evening",
+    "thank you so much", "thank you very much", "thank you",
+    "hello", "hi", "welcome", "thanks",
+    "aaah", "uhhh", "ummm", "huh", "ohh", "ah", "uh", "um", "oh",
+    "ನಮಸ್ಕಾರ", "ಹಲೋ", "ಶುಭೋದಯ", "ಧನ್ಯವಾದ", "ಸ್ವಾಗತ",
+    "ಶುಭ ಮಧ್ಯಾಹ್ನ", "ಶುಭ ಸಂಜೆ",
+    "ಆಹ್", "ಉಹ್", "ಓಹ್", "ಹೌದು", "ಹಾ", "ಹಂ", "ಹ್ಮ್",
+    "ಥ್ಯಾಂಕ್ ಯೂ", "ಥ್ಯಾಂಕ್ಸ್",
   ];
 
-  // Remove all unwanted phrases from the clean text
   let remainingText = cleanText;
   for (const phrase of unwantedPhrases) {
-    // Replace with word boundary for English words to avoid partial matching
-    const regex = new RegExp(`\\b${phrase}\\b`, 'g');
+    const regex = new RegExp(`\\b${phrase}\\b`, "g");
     remainingText = remainingText.replace(regex, "");
-    
-    // Also do a simple string split/join for non-ASCII Kannada characters since \b doesn't apply to them
+    // Simple split/join for Kannada (no word boundaries for non-ASCII)
     remainingText = remainingText.split(phrase).join("");
   }
 
-  // Clean remaining text (replace multiple spaces with a single space)
   remainingText = remainingText.replace(/\s+/g, " ").trim();
-
-  // If there is no meaningful content left, ignore it
-  if (remainingText.length === 0) {
-    return false;
-  }
-
-  return true;
+  return remainingText.length > 0;
 }
 
-async function translateAndProcessQuery(text) {
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 2 — Combined translate + topic-match LLM call 
+//
+// Returns: { translation: string, answer: string|null }
+//   translation — English translation of the Kannada input
+//   answer      — pre-defined topic reply if matched, or fallback string,
+//                 or null if not a support query at all
+// ─────────────────────────────────────────────────────────────────────────────
+async function translateAndProcessQuery(text, callLogger) {
   try {
     const prompt = `
 You are a customer support AI assistant. You will be provided with a Kannada transcript.
@@ -150,71 +160,9 @@ ${text}
         messages: [
           {
             role: "user",
-            content: `Translate the following Kannada text into natural English.\nTreat names as names and preserve context.\nReturn only the English translation.\n\nKannada:\n${text}`,
+            content: prompt, 
           },
         ],
-      }),
-    });
-    const response = await bedrock.send(command);
-    const body = JSON.parse(Buffer.from(response.body).toString());
-    return body.content[0].text;
-  } catch (err) {
-    console.error("Translation Error:", err);
-    return null;
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Bedrock: Check if a transcript segment is contextually meaningful
-// and worth sending to the support agent LLM.
-//
-// Returns: { relevant: true/false, reason: string }
-//
-// Filters OUT:
-//   - Greetings / sign-offs ("hello", "hi", "bye", "thank you")
-//   - Filler sounds ("hmm", "ahh", "ok", "yeah", "ಹೂಂ", "ಆಯ್ತು")
-//   - Small talk with no actionable content ("how are you", "which place are you from")
-//   - Very short fragments under 4 words with no meaning
-//
-// Passes THROUGH:
-//   - Issue reports ("my internet is down", "I have a problem with...")
-//   - Ticket queries ("what is the status of my ticket", "when will it be resolved")
-//   - Service requests ("I need help with...", "can you check...")
-//   - Any sentence with clear intent or a question about a service/product
-// ─────────────────────────────────────────────────────────────────────────────
-async function isContextuallyRelevant(englishText) {
-  try {
-    const prompt = `You are a filter for a customer support call transcript.
-
-Your job: decide if the customer's statement is RELEVANT to send to a support agent.
-
-RELEVANT means:
-- Reporting an issue or problem ("my internet is down", "the app is not working")
-- Asking about a ticket status or resolution ("when will my ticket be resolved", "what is the update on case 123")
-- Requesting a service or action ("can you reset my password", "I need to update my address")
-- Any question or statement that requires a support agent to take action or provide information
-
-NOT RELEVANT means:
-- Greetings and sign-offs ("hello", "hi", "good morning", "bye", "thank you", "ok")
-- Filler words and sounds ("hmm", "ahh", "yeah", "ok", "ಹೂಂ", "ಆಯ್ತು")
-- Small talk with no service intent ("how are you", "which place are you from", "nice")
-- Incomplete fragments that carry no meaning by themselves
-
-Customer said: "${englishText}"
-
-Reply with ONLY a valid JSON object on a single line, no explanation, no markdown:
-{"relevant": true, "reason": "customer is reporting an issue"}
-or
-{"relevant": false, "reason": "greeting only"}`;
-
-    const command = new InvokeModelCommand({
-      modelId: "anthropic.claude-3-haiku-20240307-v1:0",
-      contentType: "application/json",
-      accept: "application/json",
-      body: JSON.stringify({
-        anthropic_version: "bedrock-2023-05-31",
-        max_tokens: 100,
-        messages: [{ role: "user", content: prompt }],
       }),
     });
 
@@ -222,118 +170,32 @@ or
     const body = JSON.parse(Buffer.from(response.body).toString());
     const raw = body.content[0].text.trim();
 
-    // Strip markdown fences if the model adds them despite instructions
-    const clean = raw.replace(/```json|```/g, "").trim();
-    const parsed = JSON.parse(clean);
-    return parsed;
-  } catch (err) {
-    console.error("Relevance filter error:", err);
-    // On filter failure: default to relevant so nothing is silently dropped
-    return { relevant: true, reason: "filter error — defaulting to relevant" };
-  }
-}
+    callLogger.log(`translateAndProcessQuery raw response: ${raw}`);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Bedrock: Support agent LLM — responds live to a customer statement
-//
-// Role: a helpful support agent for a service company.
-// It receives only contextually relevant customer statements.
-// It replies as the agent would — acknowledging the issue, checking status,
-// or asking for the ticket/account number if needed.
-//
-// conversationHistory: array of { role: "user"|"assistant", content: string }
-//   — passed in full each call so the LLM has context of the ongoing call
-// ─────────────────────────────────────────────────────────────────────────────
-async function getAgentReply(customerStatement, conversationHistory) {
-  try {
-    const systemPrompt = `You are a professional and empathetic customer support agent.
+    // Strip markdown fences if model adds them
+    let jsonText = raw.replace(/```json|```/g, "").trim();
 
-Your responsibilities:
-- Help customers who report issues, ask about ticket status, or need service assistance
-- Acknowledge the customer's concern clearly and directly
-- If the customer mentions a ticket number or case ID, refer to it by number
-- If you need a ticket number or account detail to help, politely ask for it
-- Give concise, helpful replies — 1 to 3 sentences maximum
-- Do not use filler phrases like "Great!" or "Absolutely!" — be direct and warm
-- Never make up ticket statuses or resolution times you don't know — say you will check
-- Respond in English only`;
-
-    // Build message history: previous exchanges + current customer message
-    const messages = [
-      ...conversationHistory,
-      { role: "user", content: customerStatement },
-    ];
-
-    const command = new InvokeModelCommand({
-      modelId: "anthropic.claude-3-haiku-20240307-v1:0",
-      contentType: "application/json",
-      accept: "application/json",
-      body: JSON.stringify({
-        anthropic_version: "bedrock-2023-05-31",
-        max_tokens: 300,
-        system: systemPrompt,
-        messages,
-      }),
-    });
-
-    const response = await bedrock.send(command);
-    const body = JSON.parse(Buffer.from(response.body).toString());
-    return body.content[0].text.trim();
-    const responseBody = JSON.parse(
-      Buffer.from(response.body).toString()
-    );
-
-    const contentText = responseBody.content[0].text.trim();
-    // Strip markdown code block formatting if present
-    let jsonText = contentText;
-    if (jsonText.startsWith("```")) {
-      jsonText = jsonText.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "").trim();
-    }
-
+    // Try direct parse first
     try {
       return JSON.parse(jsonText);
-    } catch (parseErr) {
-      const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        try {
-          return JSON.parse(jsonMatch[0]);
-        } catch (regexErr) {
-          console.error("Failed to parse JSON from Bedrock response:", contentText);
-          throw regexErr;
-        }
-      }
-      console.error("Failed to parse JSON from Bedrock response:", contentText);
-      throw parseErr;
+    } catch (_) {
+      // Fallback: extract first { ... } block
+      const match = jsonText.match(/\{[\s\S]*\}/);
+      if (match) return JSON.parse(match[0]);
+      throw new Error(`Cannot parse JSON from: ${raw}`);
     }
-
   } catch (err) {
-    console.error("Agent LLM error:", err);
+    callLogger.error("translateAndProcessQuery failed", err);
     return null;
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Bedrock: Call summary
-//
-// FIX #1: max_tokens raised 400 → 1024. At 400 tokens, a JSON object with a
-//         summary + up to 5 statements + up to 5 replies + several arrays was
-//         getting truncated mid-object, so JSON.parse (and the bracket-slice
-//         fallback) both failed on genuinely incomplete JSON — which silently
-//         produced the "empty-looking" fallback summary every time.
-// FIX #2: Raw model output is now logged whenever parsing fails, so future
-//         issues are diagnosable from server logs instead of guessing.
-// FIX #3: Prompt now caps sentence/array lengths explicitly to keep responses
-//         well under the token budget.
-// FIX #4: A call with genuinely no data (nothing transcribed, no exchanges)
-//         now returns a clearly-labeled "empty call" summary instead of the
-//         same shape as a real generation failure — so the two are
-//         distinguishable when you're looking at summary-*.json files.
+// getCallSummary — called once at end of call after all data is finalized
 // ─────────────────────────────────────────────────────────────────────────────
-async function getCallSummary(callId, transcriptEntries, agentExchanges) {
-  // Nothing to summarize at all — don't waste a call, and don't return
-  // something indistinguishable from a real failure.
+async function getCallSummary(callId, transcriptEntries, agentExchanges, callLogger) {
   if (transcriptEntries.length === 0 && agentExchanges.length === 0) {
-    console.warn(`[${callId}] ⚠️  No transcript/exchange data — skipping summary LLM call`);
+    callLogger.log("No transcript/exchange data — skipping summary LLM call");
     return {
       call_id: callId,
       summary: "No content was captured during this call.",
@@ -348,17 +210,19 @@ async function getCallSummary(callId, transcriptEntries, agentExchanges) {
   }
 
   try {
-    const transcriptExcerpt = transcriptEntries
-      .slice(-20)
-      .map((entry) => `- ${entry.english}`)
+    const fullTranscript = transcriptEntries
+      .map((e, i) => `[${i + 1}] ${e.english || e.kannada}`)
       .join("\n");
 
-    const agentExchangeText = agentExchanges
-      .map(
-        (exchange) =>
-          `Customer: ${exchange.customer}\nAgent: ${exchange.agent}`
-      )
-      .join("\n\n") || "None";
+    const agentConversationText =
+      agentExchanges.length > 0
+        ? agentExchanges
+            .map(
+              (ex, i) =>
+                `Exchange ${i + 1}:\n  Customer: ${ex.customer}\n  Agent: ${ex.agent}`
+            )
+            .join("\n\n")
+        : "No agent exchanges recorded.";
 
     const systemPrompt = `You are a customer support call summarization assistant.
 
@@ -374,50 +238,43 @@ Include these fields:
 - customer_statements: array of up to 5 concise customer statements (each under 15 words)
 - agent_replies: array of up to 5 concise agent response summaries (each under 15 words)
 
-Keep every field brief. Do not exceed the limits above — a complete, valid, well-formed JSON object is required.`;
+Keep every field brief. Do not exceed the limits above.`;
 
-    const userPrompt = `Transcript excerpt:\n${transcriptExcerpt}\n\nAgent exchanges:\n${agentExchangeText}`;
+    const userMessage = `Transcript:\n${fullTranscript}\n\nAgent exchanges:\n${agentConversationText}`;
 
     const command = new InvokeModelCommand({
-      modelId: "anthropic.claude-3-haiku-20240307-v1:0",
+      modelId: process.env.MODEL_ID || "us.anthropic.claude-haiku-4-5-20251001-v1:0",
       contentType: "application/json",
       accept: "application/json",
       body: JSON.stringify({
         anthropic_version: "bedrock-2023-05-31",
         max_tokens: 1024,
         system: systemPrompt,
-        messages: [{ role: "user", content: userPrompt }],
+        messages: [{ role: "user", content: userMessage }],
       }),
     });
 
     const response = await bedrock.send(command);
     const body = JSON.parse(Buffer.from(response.body).toString());
     const raw = body.content[0].text.trim();
+
+    callLogger.log(`Summary raw response: ${raw}`);
+
     const clean = raw.replace(/```json|```/g, "").trim();
 
     try {
-      const parsed = JSON.parse(clean);
-      return parsed;
-    } catch (parseErr) {
-      const jsonStart = clean.indexOf("{");
-      const jsonEnd = clean.lastIndexOf("}");
-      if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
-        const jsonText = clean.slice(jsonStart, jsonEnd + 1);
-        try {
-          return JSON.parse(jsonText);
-        } catch (innerErr) {
-          // Log the raw output so we can see exactly what the model returned
-          console.error(`[${callId}] Summary JSON still invalid after slicing. Raw output:`);
-          console.error(raw);
-          throw innerErr;
-        }
+      return JSON.parse(clean);
+    } catch (_) {
+      const start = clean.indexOf("{");
+      const end   = clean.lastIndexOf("}");
+      if (start !== -1 && end > start) {
+        return JSON.parse(clean.slice(start, end + 1));
       }
-      console.error(`[${callId}] Summary JSON parse failed, no braces found. Raw output:`);
-      console.error(raw);
-      throw parseErr;
+      callLogger.error("Summary JSON parse failed. Raw output logged above.");
+      throw new Error("Summary JSON unparseable");
     }
   } catch (err) {
-    console.error(`[${callId}] Summary LLM error:`, err);
+    callLogger.error("getCallSummary failed", err);
     return {
       call_id: callId,
       summary: "Summary generation failed.",
@@ -433,24 +290,29 @@ Keep every field brief. Do not exceed the limits above — a complete, valid, we
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Transcribe: stream audio → push final entries with English translation
-// Also triggers the live agent pipeline for relevant segments.
+// startTranscribe — corrected pipeline flow
 //
-// Per-connection isolation guaranteed:
-//   - audioStreamGenerator  → own generator per connection
-//   - sampleRateHertz       → locked number from this connection's start event
-//   - transcriptEntries     → own array per connection (full transcript)
-//   - agentExchanges        → own array per connection (filtered agent convo)
-//   - sessionMeta           → frozen snapshot, not a live reference
+// FLOW PER FINAL SEGMENT:
+//   1. shouldProcessTranscription(kannadaText)
+//        false → store in FILE 1 with english=null, answer=null. Stop.
+//        true  → proceed
+//   2. translateAndProcessQuery(kannadaText)
+//        returns { translation, answer }
+//   3. Store in FILE 1 (transcript) always
+//   4. If answer !== null → store { customer: translation, agent: answer } in FILE 2
 // ─────────────────────────────────────────────────────────────────────────────
 async function startTranscribe(
   audioStreamGenerator,
   sampleRateHertz,
-  transcriptEntries,   // FILE 1: full transcript — every final segment
-  agentExchanges,      // FILE 2: filtered agent conversation — relevant only
+  transcriptEntries,  // FILE 1
+  agentExchanges,     // FILE 2
   sessionMeta,
-  callId
+  callId,
+  callLogger          // per-session logger
 ) {
+  callLogger.log(
+    `Transcribe starting | lang=${sessionMeta.language} | encoding=${sessionMeta.media_type} | sampleRate=${sampleRateHertz}Hz`
+  );
   console.log(
     `[${callId}] 🎛️  Transcribe starting | lang=${sessionMeta.language} | encoding=${sessionMeta.media_type} | sampleRate=${sampleRateHertz}Hz`
   );
@@ -463,86 +325,107 @@ async function startTranscribe(
   });
 
   const response = await transcribeClient.send(command);
+  callLogger.log("Transcribe stream open");
   console.log(`[${callId}] 🎙️  Transcribe stream open`);
-
-  // Conversation history for the agent LLM — grows during the call
-  // Keeps { role, content } pairs so the LLM understands the conversation so far
-  const llmConversationHistory = [];
 
   for await (const event of response.TranscriptResultStream) {
     if (!event.TranscriptEvent) continue;
 
     const results = event.TranscriptEvent.Transcript.Results;
     for (const r of results) {
-      const text = r.Alternatives[0].Transcript;
+      const kannadaText = r.Alternatives[0].Transcript;
 
       if (r.IsPartial) {
-        console.log(`[${callId}] PARTIAL: ${text}`);
+        console.log(`[${callId}] PARTIAL: ${kannadaText}`);
         continue;
       }
 
-      // ── Final transcript segment ──
-      console.log(`[${callId}] FINAL (KN): ${text}`);
+      console.log(`[${callId}] FINAL (KN): ${kannadaText}`);
+      callLogger.log(`FINAL (KN): ${kannadaText}`);
 
-      // Step 1: Translate to English
-      const english = await translateKannadaToEnglish(text);
-      console.log(`[${callId}] FINAL (EN): ${english}`);
+      // ── STEP 1: Local pre-filter (free, fast) ──
+      const passesLocalFilter = shouldProcessTranscription(kannadaText);
 
-      // Step 2: Store in full transcript (FILE 1) — always, no filtering
+      if (!passesLocalFilter) {
+        // Filler/greeting — store in transcript but skip LLM entirely
+        console.log(`[${callId}] Local filter: skipping LLM — filler/greeting`);
+        callLogger.log(`Local filter blocked: "${kannadaText}"`);
+        transcriptEntries.push({
+          timestamp: new Date().toISOString(),
+          language: sessionMeta.language,
+          kannada: kannadaText,
+          english: null,
+          answer: null,
+          filtered_by: "local",
+          media_type: sessionMeta.media_type,
+          sample_rate_hertz: sampleRateHertz,
+        });
+        continue;
+      }
+
+      // ── STEP 2: Combined translate + topic-match LLM call ──
+      console.log(`[${callId}] 🤖 Sending to translateAndProcessQuery...`);
+      const result = await translateAndProcessQuery(kannadaText, callLogger);
+
+      if (!result) {
+        // LLM call failed — still store raw in transcript
+        callLogger.log(`translateAndProcessQuery returned null for: "${kannadaText}"`);
+        transcriptEntries.push({
+          timestamp: new Date().toISOString(),
+          language: sessionMeta.language,
+          kannada: kannadaText,
+          english: null,
+          answer: null,
+          filtered_by: "llm_error",
+          media_type: sessionMeta.media_type,
+          sample_rate_hertz: sampleRateHertz,
+        });
+        continue;
+      }
+
+      const { translation, answer } = result;
+      console.log(`[${callId}] FINAL (EN): ${translation}`);
+      console.log(`[${callId}] 🤖 Agent answer: ${answer}`);
+      callLogger.log(`FINAL (EN): ${translation}`);
+      callLogger.log(`Agent answer: ${answer}`);
+
+      // ── STEP 3: Always store in FILE 1 (full transcript) ──
       transcriptEntries.push({
         timestamp: new Date().toISOString(),
         language: sessionMeta.language,
-        kannada: text,
-        english: english,
+        kannada: kannadaText,
+        english: translation,
+        answer: answer,
         media_type: sessionMeta.media_type,
         sample_rate_hertz: sampleRateHertz,
       });
 
-      // Step 3: Relevance filter — should this go to the agent LLM?
-      if (!english) {
-        console.log(`[${callId}] Skipping agent pipeline — translation failed`);
-        continue;
+      // ── STEP 4: If answer exists → store in FILE 2 (agent exchanges) ──
+      if (answer !== null && answer !== undefined) {
+        agentExchanges.push({
+          timestamp: new Date().toISOString(),
+          customer: translation,
+          agent: answer,
+        });
+        callLogger.log(`Exchange stored — customer: "${translation}" | agent: "${answer}"`);
+      } else {
+        callLogger.log(`No agent answer (not a support query) — not stored in FILE 2`);
       }
-
-      const filter = await isContextuallyRelevant(english);
-      console.log(
-        `[${callId}] Relevance filter → relevant=${filter.relevant} | reason="${filter.reason}"`
-      );
-
-      if (!filter.relevant) {
-        console.log(`[${callId}] Skipping agent LLM — not contextually relevant`);
-        continue;
-      }
-
-      // Step 4: Send to agent LLM with full conversation history (FILE 2)
-      console.log(`[${callId}] 🤖 Sending to agent LLM: "${english}"`);
-      const agentReply = await getAgentReply(english, llmConversationHistory);
-      console.log(`[${callId}] 🤖 Agent reply: "${agentReply}"`);
-
-      // Step 5: Update LLM conversation history for next turn
-      llmConversationHistory.push({ role: "user", content: english });
-      llmConversationHistory.push({ role: "assistant", content: agentReply || "" });
-
-      // Step 6: Store exchange in agent conversation file (FILE 2)
-      agentExchanges.push({
-        timestamp: new Date().toISOString(),
-        customer: english,
-        agent: agentReply,
-      });
     }
   }
 
+  callLogger.log("Transcribe stream closed");
   console.log(`[${callId}] ✅ Transcribe stream closed`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Finalize: guaranteed teardown order
-//   1. Flush audio file to disk
-//   2. Await Transcribe + translations + agent replies
-//   3. Write FILE 1: transcript-<callId>.json     (full transcript)
-//   4. Write FILE 2: conversation-<callId>.json   (agent exchanges only)
-//
-// Guard: runs exactly ONCE per connection
+// finalizeCall — guaranteed teardown order
+//   1. Flush audio file
+//   2. Await Transcribe + all LLM calls
+//   3. Write FILE 1: transcript-<callId>.json
+//   4. Write FILE 2: conversation-<callId>.json
+//   5. Generate + write FILE 3: summary-<callId>.json
+//   6. Close call logger
 // ─────────────────────────────────────────────────────────────────────────────
 async function finalizeCall({
   callId,
@@ -553,111 +436,119 @@ async function finalizeCall({
   transcriptPath,
   conversationPath,
   summaryPath,
+  callLogger,
   isPersisted,
   markPersisted,
 }) {
   if (isPersisted()) return;
   markPersisted();
 
+  callLogger.log("Finalizing call...");
   console.log(`[${callId}] 🔄 Finalizing...`);
 
   // Step 1 — flush audio file
   await new Promise((resolve) => {
-    if (audioFile.writableEnded) {
-      resolve();
-    } else {
-      audioFile.end(resolve);
-    }
+    if (audioFile.writableEnded) resolve();
+    else audioFile.end(resolve);
   });
-  console.log(`[${callId}] 🔇 Audio file flushed`);
+  callLogger.log("Audio file flushed");
+  console.log(`[${callId}] 🔇 Audio flushed`);
 
-  // Step 2 — wait for Transcribe + all LLM calls to finish
+  // Step 2 — wait for Transcribe + all LLM calls
   if (transcribePromise) {
     try {
       await transcribePromise;
     } catch (err) {
-      console.error(
-        `[${callId}] ⚠️  Transcribe error — saving partial data. Error: ${err.message || err}`
-      );
+      callLogger.error("Transcribe error during finalize", err);
+      console.error(`[${callId}] ⚠️  Transcribe error: ${err.message || err}`);
     }
   } else {
-    console.warn(`[${callId}] ⚠️  No Transcribe session (start event never received?)`);
+    callLogger.log("WARNING: No Transcribe session was started");
+    console.warn(`[${callId}] ⚠️  No Transcribe session started`);
   }
 
-  // Step 3 — write FILE 1: full transcript
+  // Step 3 — FILE 1: full transcript
   try {
     fs.writeFileSync(transcriptPath, JSON.stringify(transcriptEntries, null, 2));
-    console.log(
-      `[${callId}] 💾 FILE 1 saved | ${transcriptEntries.length} entries → ${transcriptPath}`
-    );
+    callLogger.log(`FILE 1 saved | ${transcriptEntries.length} entries → ${transcriptPath}`);
+    console.log(`[${callId}] 💾 FILE 1 | ${transcriptEntries.length} entries → ${transcriptPath}`);
   } catch (err) {
-    console.error(`[${callId}] ❌ Failed to write transcript:`, err);
+    callLogger.error("FILE 1 write failed", err);
+    console.error(`[${callId}] ❌ FILE 1 write failed:`, err);
   }
 
-  // Step 4 — write FILE 2: agent conversation exchanges
+  // Step 4 — FILE 2: agent exchanges
   try {
     fs.writeFileSync(conversationPath, JSON.stringify(agentExchanges, null, 2));
-    console.log(
-      `[${callId}] 💾 FILE 2 saved | ${agentExchanges.length} exchanges → ${conversationPath}`
-    );
+    callLogger.log(`FILE 2 saved | ${agentExchanges.length} exchanges → ${conversationPath}`);
+    console.log(`[${callId}] 💾 FILE 2 | ${agentExchanges.length} exchanges → ${conversationPath}`);
   } catch (err) {
-    console.error(`[${callId}] ❌ Failed to write conversation:`, err);
+    callLogger.error("FILE 2 write failed", err);
+    console.error(`[${callId}] ❌ FILE 2 write failed:`, err);
   }
 
-  // Step 5 — generate and write FILE 3: call summary JSON
+  // Step 5 — FILE 3: summary
+  callLogger.log("Generating call summary...");
+  console.log(`[${callId}] 📝 Generating summary...`);
   try {
-    const summary = await getCallSummary(callId, transcriptEntries, agentExchanges);
+    const summary = await getCallSummary(callId, transcriptEntries, agentExchanges, callLogger);
     fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
-    console.log(`[${callId}] 💾 FILE 3 saved | summary → ${summaryPath}`);
+    callLogger.log(`FILE 3 saved | summary → ${summaryPath}`);
+    console.log(`[${callId}] 💾 FILE 3 | summary → ${summaryPath}`);
   } catch (err) {
-    console.error(`[${callId}] ❌ Failed to write summary:`, err);
+    callLogger.error("FILE 3 write failed", err);
+    console.error(`[${callId}] ❌ FILE 3 write failed:`, err);
   }
+
+  // Step 6 — close logger
+  callLogger.log("Call finalized.");
+  callLogger.end();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WebSocket Server
-// Each connection is fully isolated — no shared mutable state between sessions.
+// WebSocket Server — each connection fully isolated
 // ─────────────────────────────────────────────────────────────────────────────
 const wss = new WebSocket.Server({ port: PORT });
 
 wss.on("connection", (ws) => {
 
-  // ── Per-connection identity ──
-  const callId = `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-  const audioPath = `${CALLS_DIR}/audio-${callId}.raw`;
-  const transcriptPath = `${CALLS_DIR}/transcript-${callId}.json`;     // FILE 1
-  const conversationPath = `${CALLS_DIR}/conversation-${callId}.json`;   // FILE 2
-  const summaryPath = `${CALLS_DIR}/summary-${callId}.json`;           // FILE 3
+  const callId           = `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+  const audioPath        = `${CALLS_DIR}/audio-${callId}.raw`;
+  const transcriptPath   = `${CALLS_DIR}/transcript-${callId}.json`;
+  const conversationPath = `${CALLS_DIR}/conversation-${callId}.json`;
+  const summaryPath      = `${CALLS_DIR}/summary-${callId}.json`;
 
+  // Per-session logger — writes to logs/call_<callId>.log
+  const callLogger = new CallLogger(callId);
+
+  callLogger.log("New connection");
   console.log(`[${callId}] 📞 New connection`);
 
-  // ── Per-connection I/O ──
-  const audioFile = fs.createWriteStream(audioPath);
-  const transcriptEntries = []; // FILE 1 — every final transcript segment
-  const agentExchanges = []; // FILE 2 — filtered customer + agent reply pairs
+  const audioFile         = fs.createWriteStream(audioPath);
+  const transcriptEntries = [];
+  const agentExchanges    = [];
 
-  // ── Per-connection state ──
   const callMeta = {
-    language: "kn-IN",
-    media_type: "pcm",
-    sample_rate_hertz: null, // set from start event
+    language:          "kn-IN",
+    media_type:        "pcm",
+    sample_rate_hertz: null,
   };
 
-  const audioQueue = [];
-  let streamEnded = false;
+  const audioQueue      = [];
+  let streamEnded       = false;
   let transcribeStarted = false;
   let transcribePromise = null;
 
-  let _persisted = false;
-  const isPersisted = () => _persisted;
+  let _persisted      = false;
+  const isPersisted   = () => _persisted;
   const markPersisted = () => { _persisted = true; };
 
-  // ── Audio generator — yields only from THIS connection's audioQueue ──
   async function* audioStream() {
     while (true) {
       if (audioQueue.length > 0) {
         yield { AudioEvent: { AudioChunk: audioQueue.shift() } };
       } else if (streamEnded) {
+        callLogger.log("Audio generator exhausted");
         console.log(`[${callId}] Audio generator done`);
         return;
       } else {
@@ -666,7 +557,6 @@ wss.on("connection", (ws) => {
     }
   }
 
-  // ── Shared teardown ──
   function triggerFinalize() {
     streamEnded = true;
     finalizeCall({
@@ -678,14 +568,15 @@ wss.on("connection", (ws) => {
       transcriptPath,
       conversationPath,
       summaryPath,
+      callLogger,
       isPersisted,
       markPersisted,
     }).catch((err) => {
+      callLogger.error("finalizeCall threw", err);
       console.error(`[${callId}] ❌ finalizeCall threw:`, err);
     });
   }
 
-  // ── Message handler ──
   ws.on("message", (msg) => {
     try {
       const data = JSON.parse(msg.toString());
@@ -693,42 +584,45 @@ wss.on("connection", (ws) => {
       switch (data.event) {
 
         case "connected":
+          callLogger.log("connected event");
           console.log(`[${callId}] connected`);
           break;
 
         case "start": {
+          callLogger.log(`start event: ${JSON.stringify(data)}`);
           console.log(`[${callId}] start event:`);
           console.log(JSON.stringify(data, null, 2));
 
-          const mediaFormat = data.start && data.start.media_format;
-          const rawRate = mediaFormat && (mediaFormat.sampleRate || mediaFormat.sample_rate);
+          const mediaFormat     = data.start && data.start.media_format;
+          const rawRate         = mediaFormat && (mediaFormat.sampleRate || mediaFormat.sample_rate);
           const sampleRateHertz = rawRate ? Number(rawRate) : null;
 
           if (!sampleRateHertz || isNaN(sampleRateHertz)) {
             console.warn(`[${callId}] ⚠️  sampleRate missing — defaulting to 8000Hz`);
+            callLogger.log("sampleRate missing — defaulting to 8000Hz");
             callMeta.sample_rate_hertz = 8000;
           } else {
             callMeta.sample_rate_hertz = sampleRateHertz;
           }
 
-          console.log(`[${callId}] 🔍 sampleRateHertz locked in: ${callMeta.sample_rate_hertz}Hz`);
+          callLogger.log(`sampleRateHertz locked: ${callMeta.sample_rate_hertz}Hz`);
+          console.log(`[${callId}] 🔍 sampleRateHertz: ${callMeta.sample_rate_hertz}Hz`);
 
           if (!transcribeStarted) {
             transcribeStarted = true;
-
-            const frozenMeta = Object.freeze({ ...callMeta });
-            const lockedRate = callMeta.sample_rate_hertz;
+            const frozenMeta  = Object.freeze({ ...callMeta });
+            const lockedRate  = callMeta.sample_rate_hertz;
 
             transcribePromise = startTranscribe(
               audioStream(),
               lockedRate,
-              transcriptEntries,   // FILE 1 array
-              agentExchanges,      // FILE 2 array
+              transcriptEntries,
+              agentExchanges,
               frozenMeta,
-              callId
+              callId,
+              callLogger   // pass logger into transcribe pipeline
             );
-
-            transcribePromise.catch(() => { });
+            transcribePromise.catch(() => {});
           }
           break;
         }
@@ -741,24 +635,29 @@ wss.on("connection", (ws) => {
         }
 
         case "stop":
+          callLogger.log("stop event received");
           console.log(`[${callId}] stop event`);
           triggerFinalize();
           break;
 
         default:
+          callLogger.log(`unknown event: ${data.event}`);
           console.log(`[${callId}] unknown event: ${data.event}`);
       }
     } catch (err) {
+      callLogger.error("Error parsing message", err);
       console.error(`[${callId}] Error parsing message:`, err);
     }
   });
 
   ws.on("close", () => {
+    callLogger.log("WebSocket closed");
     console.log(`[${callId}] WebSocket closed`);
     triggerFinalize();
   });
 
   ws.on("error", (err) => {
+    callLogger.error("WebSocket error", err);
     console.error(`[${callId}] WebSocket error:`, err);
     triggerFinalize();
   });
