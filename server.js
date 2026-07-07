@@ -313,9 +313,6 @@ async function startTranscribe(
   callLogger.log(
     `Transcribe starting | lang=${sessionMeta.language} | encoding=${sessionMeta.media_type} | sampleRate=${sampleRateHertz}Hz`
   );
-  console.log(
-    `[${callId}] 🎛️  Transcribe starting | lang=${sessionMeta.language} | encoding=${sessionMeta.media_type} | sampleRate=${sampleRateHertz}Hz`
-  );
 
   const command = new StartStreamTranscriptionCommand({
     LanguageCode: sessionMeta.language,
@@ -326,7 +323,6 @@ async function startTranscribe(
 
   const response = await transcribeClient.send(command);
   callLogger.log("Transcribe stream open");
-  console.log(`[${callId}] 🎙️  Transcribe stream open`);
 
   for await (const event of response.TranscriptResultStream) {
     if (!event.TranscriptEvent) continue;
@@ -336,7 +332,7 @@ async function startTranscribe(
       const kannadaText = r.Alternatives[0].Transcript;
 
       if (r.IsPartial) {
-        console.log(`[${callId}] PARTIAL: ${kannadaText}`);
+        callLogger.log(`partial transcript: ${kannadaText}`);
         continue;
       }
 
@@ -348,7 +344,6 @@ async function startTranscribe(
 
       if (!passesLocalFilter) {
         // Filler/greeting — store in transcript but skip LLM entirely
-        console.log(`[${callId}] Local filter: skipping LLM — filler/greeting`);
         callLogger.log(`Local filter blocked: "${kannadaText}"`);
         transcriptEntries.push({
           timestamp: new Date().toISOString(),
@@ -364,7 +359,7 @@ async function startTranscribe(
       }
 
       // ── STEP 2: Combined translate + topic-match LLM call ──
-      console.log(`[${callId}] 🤖 Sending to translateAndProcessQuery...`);
+      callLogger.log(`sending to translateAndProcessQuery: ${kannadaText}`);
       const result = await translateAndProcessQuery(kannadaText, callLogger);
 
       if (!result) {
@@ -415,7 +410,6 @@ async function startTranscribe(
   }
 
   callLogger.log("Transcribe stream closed");
-  console.log(`[${callId}] ✅ Transcribe stream closed`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -444,7 +438,6 @@ async function finalizeCall({
   markPersisted();
 
   callLogger.log("Finalizing call...");
-  console.log(`[${callId}] 🔄 Finalizing...`);
 
   // Step 1 — flush audio file
   await new Promise((resolve) => {
@@ -452,7 +445,6 @@ async function finalizeCall({
     else audioFile.end(resolve);
   });
   callLogger.log("Audio file flushed");
-  console.log(`[${callId}] 🔇 Audio flushed`);
 
   // Step 2 — wait for Transcribe + all LLM calls
   if (transcribePromise) {
@@ -471,7 +463,6 @@ async function finalizeCall({
   try {
     fs.writeFileSync(transcriptPath, JSON.stringify(transcriptEntries, null, 2));
     callLogger.log(`FILE 1 saved | ${transcriptEntries.length} entries → ${transcriptPath}`);
-    console.log(`[${callId}] 💾 FILE 1 | ${transcriptEntries.length} entries → ${transcriptPath}`);
   } catch (err) {
     callLogger.error("FILE 1 write failed", err);
     console.error(`[${callId}] ❌ FILE 1 write failed:`, err);
@@ -481,7 +472,6 @@ async function finalizeCall({
   try {
     fs.writeFileSync(conversationPath, JSON.stringify(agentExchanges, null, 2));
     callLogger.log(`FILE 2 saved | ${agentExchanges.length} exchanges → ${conversationPath}`);
-    console.log(`[${callId}] 💾 FILE 2 | ${agentExchanges.length} exchanges → ${conversationPath}`);
   } catch (err) {
     callLogger.error("FILE 2 write failed", err);
     console.error(`[${callId}] ❌ FILE 2 write failed:`, err);
@@ -489,12 +479,10 @@ async function finalizeCall({
 
   // Step 5 — FILE 3: summary
   callLogger.log("Generating call summary...");
-  console.log(`[${callId}] 📝 Generating summary...`);
   try {
     const summary = await getCallSummary(callId, transcriptEntries, agentExchanges, callLogger);
     fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
     callLogger.log(`FILE 3 saved | summary → ${summaryPath}`);
-    console.log(`[${callId}] 💾 FILE 3 | summary → ${summaryPath}`);
   } catch (err) {
     callLogger.error("FILE 3 write failed", err);
     console.error(`[${callId}] ❌ FILE 3 write failed:`, err);
@@ -522,7 +510,6 @@ wss.on("connection", (ws) => {
   const callLogger = new CallLogger(callId);
 
   callLogger.log("New connection");
-  console.log(`[${callId}] 📞 New connection`);
 
   const audioFile         = fs.createWriteStream(audioPath);
   const transcriptEntries = [];
@@ -549,7 +536,6 @@ wss.on("connection", (ws) => {
         yield { AudioEvent: { AudioChunk: audioQueue.shift() } };
       } else if (streamEnded) {
         callLogger.log("Audio generator exhausted");
-        console.log(`[${callId}] Audio generator done`);
         return;
       } else {
         await new Promise((r) => setTimeout(r, 50));
@@ -579,26 +565,26 @@ wss.on("connection", (ws) => {
 
   ws.on("message", (msg) => {
     try {
-      const data = JSON.parse(msg.toString());
+      const rawText = msg.toString();
+      const data = JSON.parse(rawText);
+      if (data.event === "media") {
+        callLogger.log('incoming message: {"event":"media"}');
+      } else {
+        callLogger.log(`incoming message: ${rawText}`);
+      }
 
       switch (data.event) {
-
         case "connected":
-          callLogger.log("connected event");
-          console.log(`[${callId}] connected`);
+          callLogger.log("received connected event");
           break;
 
         case "start": {
-          callLogger.log(`start event: ${JSON.stringify(data)}`);
-          console.log(`[${callId}] start event:`);
-          console.log(JSON.stringify(data, null, 2));
-
+          callLogger.log(`received start event: ${JSON.stringify(data)}`);
           const mediaFormat     = data.start && data.start.media_format;
           const rawRate         = mediaFormat && (mediaFormat.sampleRate || mediaFormat.sample_rate);
           const sampleRateHertz = rawRate ? Number(rawRate) : null;
 
           if (!sampleRateHertz || isNaN(sampleRateHertz)) {
-            console.warn(`[${callId}] ⚠️  sampleRate missing — defaulting to 8000Hz`);
             callLogger.log("sampleRate missing — defaulting to 8000Hz");
             callMeta.sample_rate_hertz = 8000;
           } else {
@@ -606,12 +592,11 @@ wss.on("connection", (ws) => {
           }
 
           callLogger.log(`sampleRateHertz locked: ${callMeta.sample_rate_hertz}Hz`);
-          console.log(`[${callId}] 🔍 sampleRateHertz: ${callMeta.sample_rate_hertz}Hz`);
 
           if (!transcribeStarted) {
             transcribeStarted = true;
-            const frozenMeta  = Object.freeze({ ...callMeta });
-            const lockedRate  = callMeta.sample_rate_hertz;
+            const frozenMeta = Object.freeze({ ...callMeta });
+            const lockedRate = callMeta.sample_rate_hertz;
 
             transcribePromise = startTranscribe(
               audioStream(),
@@ -620,7 +605,7 @@ wss.on("connection", (ws) => {
               agentExchanges,
               frozenMeta,
               callId,
-              callLogger   // pass logger into transcribe pipeline
+              callLogger
             );
             transcribePromise.catch(() => {});
           }
@@ -635,14 +620,12 @@ wss.on("connection", (ws) => {
         }
 
         case "stop":
-          callLogger.log("stop event received");
-          console.log(`[${callId}] stop event`);
+          callLogger.log("received stop event");
           triggerFinalize();
           break;
 
         default:
-          callLogger.log(`unknown event: ${data.event}`);
-          console.log(`[${callId}] unknown event: ${data.event}`);
+          callLogger.log(`received unknown event: ${data.event}`);
       }
     } catch (err) {
       callLogger.error("Error parsing message", err);
@@ -652,7 +635,6 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     callLogger.log("WebSocket closed");
-    console.log(`[${callId}] WebSocket closed`);
     triggerFinalize();
   });
 
