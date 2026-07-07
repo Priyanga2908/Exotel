@@ -1,7 +1,41 @@
 require("dotenv").config();
 
 const fs = require("fs");
+const path = require("path");
 const WebSocket = require("ws");
+
+class CallLogger {
+  constructor(sessionId) {
+    this.sessionId = sessionId;
+    this.logsDir = path.join(__dirname, "logs");
+    this.filePath = path.join(this.logsDir, `call_${sessionId}.log`);
+    
+    // Ensure logs directory exists
+    if (!fs.existsSync(this.logsDir)) {
+      fs.mkdirSync(this.logsDir, { recursive: true });
+    }
+    
+    this.stream = fs.createWriteStream(this.filePath, { flags: 'a' });
+  }
+
+  log(msg) {
+    const timestamp = new Date().toISOString();
+    this.stream.write(`[${timestamp}] ${msg}\n`);
+  }
+
+  error(msg, err) {
+    const timestamp = new Date().toISOString();
+    if (err) {
+      this.stream.write(`[${timestamp}] ERROR: ${msg} - ${err.stack || err.message || err}\n`);
+    } else {
+      this.stream.write(`[${timestamp}] ERROR: ${msg}\n`);
+    }
+  }
+
+  end() {
+    this.stream.end();
+  }
+}
 const {
   TranscribeStreamingClient,
   StartStreamTranscriptionCommand,
@@ -31,18 +65,88 @@ process.on("unhandledRejection", (reason) => {
   console.dir(reason, { depth: null });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Bedrock: Translate Kannada → English
-// ─────────────────────────────────────────────────────────────────────────────
-async function translateKannadaToEnglish(text) {
+function shouldProcessTranscription(text) {
+  if (!text) return false;
+  
+  // Normalize: lower case and trim
+  let cleanText = text.toLowerCase().trim();
+  if (cleanText.length === 0) return false;
+
+  // Remove punctuation
+  cleanText = cleanText.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, "").trim();
+
+  // List of filler words/noises/greetings to filter out
+  const unwantedPhrases = [
+    "good morning", "good afternoon", "good evening", "thank you so much", "thank you very much", "thank you",
+    "hello", "hi", "welcome", "thanks", "aaah", "uhhh", "ummm", "huh", "ohh", "ah", "uh", "um", "oh",
+    "ನಮಸ್ಕಾರ", "ಹಲೋ", "ಶುಭೋದಯ", "ಧನ್ಯವಾದ", "ಸ್ವಾಗತ", "ಶುಭ ಮಧ್ಯಾಹ್ನ", "ಶುಭ ಸಂಜೆ",
+    "ಆಹ್", "ಉಹ್", "ಓಹ್", "ಹೌದು", "ಹಾ", "ಹಂ", "ಹ್ಮ್", "ಥ್ಯಾಂಕ್ ಯೂ", "ಥ್ಯಾಂಕ್ಸ್"
+  ];
+
+  // Remove all unwanted phrases from the clean text
+  let remainingText = cleanText;
+  for (const phrase of unwantedPhrases) {
+    // Replace with word boundary for English words to avoid partial matching
+    const regex = new RegExp(`\\b${phrase}\\b`, 'g');
+    remainingText = remainingText.replace(regex, "");
+    
+    // Also do a simple string split/join for non-ASCII Kannada characters since \b doesn't apply to them
+    remainingText = remainingText.split(phrase).join("");
+  }
+
+  // Clean remaining text (replace multiple spaces with a single space)
+  remainingText = remainingText.replace(/\s+/g, " ").trim();
+
+  // If there is no meaningful content left, ignore it
+  if (remainingText.length === 0) {
+    return false;
+  }
+
+  return true;
+}
+
+async function translateAndProcessQuery(text) {
   try {
+    const prompt = `
+You are a customer support AI assistant. You will be provided with a Kannada transcript.
+Your task is to:
+1. Translate the Kannada text to English.
+2. Analyze if the text contains a customer support query or question directed to the support team.
+3. If it does contain a query, determine if it relates to any of these 10 predefined topics:
+   - Topic 1: Ticket Status (e.g. status, ticket progress) -> Answer: "Your ticket status is currently 'In Progress'. Our engineering team is active on it."
+   - Topic 2: Resolution Time (e.g. when will it be solved/fixed) -> Answer: "The estimated resolution time is within the next 2 hours."
+   - Topic 3: Assigned Agent (e.g. who is handling this, who is my agent) -> Answer: "Your assigned support agent is Rithish."
+   - Topic 4: Supervisor Escalation (e.g. speak to manager/supervisor) -> Answer: "Certainly. I can escalate this call to our supervisor, Priya, but please note she is currently on another call."
+   - Topic 5: Check Updates (e.g. how do I check progress, where to view updates) -> Answer: "You can check updates by logging into your Exotel dashboard or via the SMS link sent to your registered mobile number."
+   - Topic 6: Service Down (e.g. why is my internet/service down, outage) -> Answer: "We are experiencing a temporary fiber cut in your area, which has caused a localized outage."
+   - Topic 7: Restoration Time (e.g. when will service be restored/back online) -> Answer: "The service is expected to be restored by 4:00 PM today."
+   - Topic 8: Billing / Balance (e.g. bill amount, balance check, payment due) -> Answer: "Your outstanding bill amount is ₹450, due on the 15th of this month."
+   - Topic 9: Refund Request (e.g. refund status, refund policy, money back) -> Answer: "Refund requests are processed within 5-7 working days after validation by our billing team."
+   - Topic 10: New Ticket (e.g. raise a new ticket, file a new complaint) -> Answer: "I would be happy to raise a new ticket for you. The ticket number is #EX89230."
+
+   Rule:
+   - If it matches or is semantically close to one of the topics above, return the exact Answer specified.
+   - If it is a customer support query/question but does NOT relate to any of the 10 topics above, return: "We will check into it later. The support team will contact you."
+   - If it is NOT a support query/question (e.g., just conversational text, statement, greeting, filler), return null for the answer.
+
+Respond ONLY with a JSON object containing two keys: "translation" and "answer". Do not include any formatting, markdown wrappers, backticks, or explanation.
+Example Output:
+{
+  "translation": "Hello, when will my internet be restored?",
+  "answer": "The service is expected to be restored by 4:00 PM today."
+}
+
+Kannada Text:
+${text}
+`;
+
     const command = new InvokeModelCommand({
-      modelId: "anthropic.claude-3-haiku-20240307-v1:0",
+      modelId: process.env.MODEL_ID || "us.anthropic.claude-haiku-4-5-20251001-v1:0",
       contentType: "application/json",
       accept: "application/json",
       body: JSON.stringify({
         anthropic_version: "bedrock-2023-05-31",
-        max_tokens: 200,
+        max_tokens: 300,
         messages: [
           {
             role: "user",
@@ -175,6 +279,33 @@ Your responsibilities:
     const response = await bedrock.send(command);
     const body = JSON.parse(Buffer.from(response.body).toString());
     return body.content[0].text.trim();
+    const responseBody = JSON.parse(
+      Buffer.from(response.body).toString()
+    );
+
+    const contentText = responseBody.content[0].text.trim();
+    // Strip markdown code block formatting if present
+    let jsonText = contentText;
+    if (jsonText.startsWith("```")) {
+      jsonText = jsonText.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "").trim();
+    }
+
+    try {
+      return JSON.parse(jsonText);
+    } catch (parseErr) {
+      const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        try {
+          return JSON.parse(jsonMatch[0]);
+        } catch (regexErr) {
+          console.error("Failed to parse JSON from Bedrock response:", contentText);
+          throw regexErr;
+        }
+      }
+      console.error("Failed to parse JSON from Bedrock response:", contentText);
+      throw parseErr;
+    }
+
   } catch (err) {
     console.error("Agent LLM error:", err);
     return null;
