@@ -182,6 +182,126 @@ Your responsibilities:
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Bedrock: Call summary
+//
+// FIX #1: max_tokens raised 400 → 1024. At 400 tokens, a JSON object with a
+//         summary + up to 5 statements + up to 5 replies + several arrays was
+//         getting truncated mid-object, so JSON.parse (and the bracket-slice
+//         fallback) both failed on genuinely incomplete JSON — which silently
+//         produced the "empty-looking" fallback summary every time.
+// FIX #2: Raw model output is now logged whenever parsing fails, so future
+//         issues are diagnosable from server logs instead of guessing.
+// FIX #3: Prompt now caps sentence/array lengths explicitly to keep responses
+//         well under the token budget.
+// FIX #4: A call with genuinely no data (nothing transcribed, no exchanges)
+//         now returns a clearly-labeled "empty call" summary instead of the
+//         same shape as a real generation failure — so the two are
+//         distinguishable when you're looking at summary-*.json files.
+// ─────────────────────────────────────────────────────────────────────────────
+async function getCallSummary(callId, transcriptEntries, agentExchanges) {
+  // Nothing to summarize at all — don't waste a call, and don't return
+  // something indistinguishable from a real failure.
+  if (transcriptEntries.length === 0 && agentExchanges.length === 0) {
+    console.warn(`[${callId}] ⚠️  No transcript/exchange data — skipping summary LLM call`);
+    return {
+      call_id: callId,
+      summary: "No content was captured during this call.",
+      issues_reported: [],
+      action_items: [],
+      ticket_ids: [],
+      customer_sentiment: "unknown",
+      customer_statements: [],
+      agent_replies: [],
+      note: "empty_call",
+    };
+  }
+
+  try {
+    const transcriptExcerpt = transcriptEntries
+      .slice(-20)
+      .map((entry) => `- ${entry.english}`)
+      .join("\n");
+
+    const agentExchangeText = agentExchanges
+      .map(
+        (exchange) =>
+          `Customer: ${exchange.customer}\nAgent: ${exchange.agent}`
+      )
+      .join("\n\n") || "None";
+
+    const systemPrompt = `You are a customer support call summarization assistant.
+
+Create a JSON summary of the completed call. Return ONLY valid JSON, with no markdown fences and no extra text.
+
+Include these fields:
+- call_id: string
+- summary: concise summary of the customer issue and the agent response (max 3 sentences)
+- issues_reported: array of issue descriptions (max 5 items, each under 15 words)
+- action_items: array of next-step actions for the support team (max 5 items, each under 15 words)
+- ticket_ids: array of extracted ticket or case numbers, if any
+- customer_sentiment: "positive", "neutral", or "negative"
+- customer_statements: array of up to 5 concise customer statements (each under 15 words)
+- agent_replies: array of up to 5 concise agent response summaries (each under 15 words)
+
+Keep every field brief. Do not exceed the limits above — a complete, valid, well-formed JSON object is required.`;
+
+    const userPrompt = `Transcript excerpt:\n${transcriptExcerpt}\n\nAgent exchanges:\n${agentExchangeText}`;
+
+    const command = new InvokeModelCommand({
+      modelId: "anthropic.claude-3-haiku-20240307-v1:0",
+      contentType: "application/json",
+      accept: "application/json",
+      body: JSON.stringify({
+        anthropic_version: "bedrock-2023-05-31",
+        max_tokens: 1024,
+        system: systemPrompt,
+        messages: [{ role: "user", content: userPrompt }],
+      }),
+    });
+
+    const response = await bedrock.send(command);
+    const body = JSON.parse(Buffer.from(response.body).toString());
+    const raw = body.content[0].text.trim();
+    const clean = raw.replace(/```json|```/g, "").trim();
+
+    try {
+      const parsed = JSON.parse(clean);
+      return parsed;
+    } catch (parseErr) {
+      const jsonStart = clean.indexOf("{");
+      const jsonEnd = clean.lastIndexOf("}");
+      if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
+        const jsonText = clean.slice(jsonStart, jsonEnd + 1);
+        try {
+          return JSON.parse(jsonText);
+        } catch (innerErr) {
+          // Log the raw output so we can see exactly what the model returned
+          console.error(`[${callId}] Summary JSON still invalid after slicing. Raw output:`);
+          console.error(raw);
+          throw innerErr;
+        }
+      }
+      console.error(`[${callId}] Summary JSON parse failed, no braces found. Raw output:`);
+      console.error(raw);
+      throw parseErr;
+    }
+  } catch (err) {
+    console.error(`[${callId}] Summary LLM error:`, err);
+    return {
+      call_id: callId,
+      summary: "Summary generation failed.",
+      issues_reported: [],
+      action_items: [],
+      ticket_ids: [],
+      customer_sentiment: "unknown",
+      customer_statements: [],
+      agent_replies: [],
+      error: err.message || String(err),
+    };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Transcribe: stream audio → push final entries with English translation
 // Also triggers the live agent pipeline for relevant segments.
 //
@@ -269,7 +389,7 @@ async function startTranscribe(
       console.log(`[${callId}] 🤖 Agent reply: "${agentReply}"`);
 
       // Step 5: Update LLM conversation history for next turn
-      llmConversationHistory.push({ role: "user",      content: english });
+      llmConversationHistory.push({ role: "user", content: english });
       llmConversationHistory.push({ role: "assistant", content: agentReply || "" });
 
       // Step 6: Store exchange in agent conversation file (FILE 2)
@@ -301,6 +421,7 @@ async function finalizeCall({
   agentExchanges,
   transcriptPath,
   conversationPath,
+  summaryPath,
   isPersisted,
   markPersisted,
 }) {
@@ -351,6 +472,15 @@ async function finalizeCall({
   } catch (err) {
     console.error(`[${callId}] ❌ Failed to write conversation:`, err);
   }
+
+  // Step 5 — generate and write FILE 3: call summary JSON
+  try {
+    const summary = await getCallSummary(callId, transcriptEntries, agentExchanges);
+    fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
+    console.log(`[${callId}] 💾 FILE 3 saved | summary → ${summaryPath}`);
+  } catch (err) {
+    console.error(`[${callId}] ❌ Failed to write summary:`, err);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -362,33 +492,34 @@ const wss = new WebSocket.Server({ port: PORT });
 wss.on("connection", (ws) => {
 
   // ── Per-connection identity ──
-  const callId           = `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-  const audioPath        = `${CALLS_DIR}/audio-${callId}.raw`;
-  const transcriptPath   = `${CALLS_DIR}/transcript-${callId}.json`;     // FILE 1
+  const callId = `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+  const audioPath = `${CALLS_DIR}/audio-${callId}.raw`;
+  const transcriptPath = `${CALLS_DIR}/transcript-${callId}.json`;     // FILE 1
   const conversationPath = `${CALLS_DIR}/conversation-${callId}.json`;   // FILE 2
+  const summaryPath = `${CALLS_DIR}/summary-${callId}.json`;           // FILE 3
 
   console.log(`[${callId}] 📞 New connection`);
 
   // ── Per-connection I/O ──
-  const audioFile        = fs.createWriteStream(audioPath);
+  const audioFile = fs.createWriteStream(audioPath);
   const transcriptEntries = []; // FILE 1 — every final transcript segment
-  const agentExchanges    = []; // FILE 2 — filtered customer + agent reply pairs
+  const agentExchanges = []; // FILE 2 — filtered customer + agent reply pairs
 
   // ── Per-connection state ──
   const callMeta = {
-    language:          "kn-IN",
-    media_type:        "pcm",
+    language: "kn-IN",
+    media_type: "pcm",
     sample_rate_hertz: null, // set from start event
   };
 
-  const audioQueue      = [];
-  let streamEnded       = false;
+  const audioQueue = [];
+  let streamEnded = false;
   let transcribeStarted = false;
   let transcribePromise = null;
 
-  let _persisted       = false;
-  const isPersisted    = () => _persisted;
-  const markPersisted  = () => { _persisted = true; };
+  let _persisted = false;
+  const isPersisted = () => _persisted;
+  const markPersisted = () => { _persisted = true; };
 
   // ── Audio generator — yields only from THIS connection's audioQueue ──
   async function* audioStream() {
@@ -415,6 +546,7 @@ wss.on("connection", (ws) => {
       agentExchanges,
       transcriptPath,
       conversationPath,
+      summaryPath,
       isPersisted,
       markPersisted,
     }).catch((err) => {
@@ -438,7 +570,7 @@ wss.on("connection", (ws) => {
           console.log(JSON.stringify(data, null, 2));
 
           const mediaFormat = data.start && data.start.media_format;
-          const rawRate     = mediaFormat && (mediaFormat.sampleRate || mediaFormat.sample_rate);
+          const rawRate = mediaFormat && (mediaFormat.sampleRate || mediaFormat.sample_rate);
           const sampleRateHertz = rawRate ? Number(rawRate) : null;
 
           if (!sampleRateHertz || isNaN(sampleRateHertz)) {
@@ -465,7 +597,7 @@ wss.on("connection", (ws) => {
               callId
             );
 
-            transcribePromise.catch(() => {});
+            transcribePromise.catch(() => { });
           }
           break;
         }
