@@ -151,11 +151,10 @@ ${text}
 `;
 
     const command = new InvokeModelCommand({
-      modelId: process.env.MODEL_ID || "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      modelId: "google.gemma-3-4b-it",
       contentType: "application/json",
       accept: "application/json",
       body: JSON.stringify({
-        anthropic_version: "bedrock-2023-05-31",
         max_tokens: 300,
         messages: [
           {
@@ -168,7 +167,7 @@ ${text}
 
     const response = await bedrock.send(command);
     const body = JSON.parse(Buffer.from(response.body).toString());
-    const raw = body.content[0].text.trim();
+    const raw = body.choices[0].message.content.trim();
 
     callLogger.log(`translateAndProcessQuery raw response: ${raw}`);
 
@@ -187,105 +186,6 @@ ${text}
   } catch (err) {
     callLogger.error("translateAndProcessQuery failed", err);
     return null;
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// getCallSummary — called once at end of call after all data is finalized
-// ─────────────────────────────────────────────────────────────────────────────
-async function getCallSummary(callId, transcriptEntries, agentExchanges, callLogger) {
-  if (transcriptEntries.length === 0 && agentExchanges.length === 0) {
-    callLogger.log("No transcript/exchange data — skipping summary LLM call");
-    return {
-      call_id: callId,
-      summary: "No content was captured during this call.",
-      issues_reported: [],
-      action_items: [],
-      ticket_ids: [],
-      customer_sentiment: "unknown",
-      customer_statements: [],
-      agent_replies: [],
-      note: "empty_call",
-    };
-  }
-
-  try {
-    const fullTranscript = transcriptEntries
-      .map((e, i) => `[${i + 1}] ${e.english || e.kannada}`)
-      .join("\n");
-
-    const agentConversationText =
-      agentExchanges.length > 0
-        ? agentExchanges
-            .map(
-              (ex, i) =>
-                `Exchange ${i + 1}:\n  Customer: ${ex.customer}\n  Agent: ${ex.agent}`
-            )
-            .join("\n\n")
-        : "No agent exchanges recorded.";
-
-    const systemPrompt = `You are a customer support call summarization assistant.
-
-Create a JSON summary of the completed call. Return ONLY valid JSON, with no markdown fences and no extra text.
-
-Include these fields:
-- call_id: string
-- summary: concise summary of the customer issue and the agent response (max 3 sentences)
-- issues_reported: array of issue descriptions (max 5 items, each under 15 words)
-- action_items: array of next-step actions for the support team (max 5 items, each under 15 words)
-- ticket_ids: array of extracted ticket or case numbers, if any
-- customer_sentiment: "positive", "neutral", or "negative"
-- customer_statements: array of up to 5 concise customer statements (each under 15 words)
-- agent_replies: array of up to 5 concise agent response summaries (each under 15 words)
-
-Keep every field brief. Do not exceed the limits above.`;
-
-    const userMessage = `Transcript:\n${fullTranscript}\n\nAgent exchanges:\n${agentConversationText}`;
-
-    const command = new InvokeModelCommand({
-      modelId: process.env.MODEL_ID || "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-      contentType: "application/json",
-      accept: "application/json",
-      body: JSON.stringify({
-        anthropic_version: "bedrock-2023-05-31",
-        max_tokens: 1024,
-        system: systemPrompt,
-        messages: [{ role: "user", content: userMessage }],
-      }),
-    });
-
-    const response = await bedrock.send(command);
-    const body = JSON.parse(Buffer.from(response.body).toString());
-    const raw = body.content[0].text.trim();
-
-    callLogger.log(`Summary raw response: ${raw}`);
-
-    const clean = raw.replace(/```json|```/g, "").trim();
-
-    try {
-      return JSON.parse(clean);
-    } catch (_) {
-      const start = clean.indexOf("{");
-      const end   = clean.lastIndexOf("}");
-      if (start !== -1 && end > start) {
-        return JSON.parse(clean.slice(start, end + 1));
-      }
-      callLogger.error("Summary JSON parse failed. Raw output logged above.");
-      throw new Error("Summary JSON unparseable");
-    }
-  } catch (err) {
-    callLogger.error("getCallSummary failed", err);
-    return {
-      call_id: callId,
-      summary: "Summary generation failed.",
-      issues_reported: [],
-      action_items: [],
-      ticket_ids: [],
-      customer_sentiment: "unknown",
-      customer_statements: [],
-      agent_replies: [],
-      error: err.message || String(err),
-    };
   }
 }
 
@@ -418,8 +318,7 @@ async function startTranscribe(
 //   2. Await Transcribe + all LLM calls
 //   3. Write FILE 1: transcript-<callId>.json
 //   4. Write FILE 2: conversation-<callId>.json
-//   5. Generate + write FILE 3: summary-<callId>.json
-//   6. Close call logger
+//   5. Close call logger
 // ─────────────────────────────────────────────────────────────────────────────
 async function finalizeCall({
   callId,
@@ -429,7 +328,6 @@ async function finalizeCall({
   agentExchanges,
   transcriptPath,
   conversationPath,
-  summaryPath,
   callLogger,
   isPersisted,
   markPersisted,
@@ -477,18 +375,7 @@ async function finalizeCall({
     console.error(`[${callId}] ❌ FILE 2 write failed:`, err);
   }
 
-  // Step 5 — FILE 3: summary
-  callLogger.log("Generating call summary...");
-  try {
-    const summary = await getCallSummary(callId, transcriptEntries, agentExchanges, callLogger);
-    fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
-    callLogger.log(`FILE 3 saved | summary → ${summaryPath}`);
-  } catch (err) {
-    callLogger.error("FILE 3 write failed", err);
-    console.error(`[${callId}] ❌ FILE 3 write failed:`, err);
-  }
-
-  // Step 6 — close logger
+  // Step 5 — close logger
   callLogger.log("Call finalized.");
   callLogger.end();
 }
@@ -504,7 +391,6 @@ wss.on("connection", (ws) => {
   const audioPath        = `${CALLS_DIR}/audio-${callId}.raw`;
   const transcriptPath   = `${CALLS_DIR}/transcript-${callId}.json`;
   const conversationPath = `${CALLS_DIR}/conversation-${callId}.json`;
-  const summaryPath      = `${CALLS_DIR}/summary-${callId}.json`;
 
   // Per-session logger — writes to logs/call_<callId>.log
   const callLogger = new CallLogger(callId);
@@ -553,7 +439,6 @@ wss.on("connection", (ws) => {
       agentExchanges,
       transcriptPath,
       conversationPath,
-      summaryPath,
       callLogger,
       isPersisted,
       markPersisted,
