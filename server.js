@@ -118,11 +118,17 @@ function shouldProcessTranscription(text) {
 async function translateAndProcessQuery(text, callLogger) {
   try {
     const prompt = `
-You are a customer support AI assistant. You will be provided with a Kannada transcript.
-Your task is to:
-1. Translate the Kannada text to English.
-2. Analyze if the text contains a customer support query or question directed to the support team.
-3. If it does contain a query, determine if it relates to any of these 10 predefined topics:
+You are a customer support AI assistant. You will be provided with a transcript from a call. The transcript may be in Kannada characters, English characters, or Kannada transliterated/written using the English alphabet (e.g. "Namaskara", "hesaru", "nana", "bandiddini", "bandardini", "ivattu", "hege").
+
+Your task is to perform two steps:
+1. Translate the input text accurately to English. If the text contains Kannada words (even if written in the English alphabet), translate them to their actual English meanings. 
+   - E.g., "Namskar" -> "Hello/Greetings"
+   - E.g., "nana hesaru" -> "my name is"
+   - E.g., "nanu ivatu office-ge bandiddini/bandardini" -> "I came/arrived to the office today"
+   - E.g., "hege iddeera" -> "how are you"
+   Ensure the translation is a literal and accurate translation of the input text. Do not make up any information or base the translation on the support topics below.
+
+2. Analyze the TRANSLATED English text to see if it contains a customer support query/question. If it does, match it to one of these 10 predefined topics:
    - Topic 1: Ticket Status (e.g. status, ticket progress) -> Answer: "Your ticket status is currently 'In Progress'. Our engineering team is active on it."
    - Topic 2: Resolution Time (e.g. when will it be solved/fixed) -> Answer: "The estimated resolution time is within the next 2 hours."
    - Topic 3: Assigned Agent (e.g. who is handling this, who is my agent) -> Answer: "Your assigned support agent is Rithish."
@@ -134,19 +140,16 @@ Your task is to:
    - Topic 9: Refund Request (e.g. refund status, refund policy, money back) -> Answer: "Refund requests are processed within 5-7 working days after validation by our billing team."
    - Topic 10: New Ticket (e.g. raise a new ticket, file a new complaint) -> Answer: "I would be happy to raise a new ticket for you. The ticket number is #EX89230."
 
-   Rule:
-   - If it matches or is semantically close to one of the topics above, return the exact Answer specified.
-   - If it is a customer support query/question but does NOT relate to any of the 10 topics above, return: "We will check into it later. The support team will contact you."
-   - If it is NOT a support query/question (e.g., just conversational text, statement, greeting, filler), return null for the answer.
+    Rules:
+    - The "translation" field must contain ONLY the literal, accurate English translation of the input text.
+    - If the translated text is NOT a customer support query or question (e.g., greetings, introducing oneself, or general statements like "I came to the office today", "I am in the office", "Hello sir, my name is Shanti"), the "answer" field MUST be null.
+    - If the translated text contains an actual customer support query or question:
+      * If it relates to any of the 10 topics above, return the exact Answer specified.
+      * If it does NOT relate to any of the 10 topics above, return: "We will check into it. Later The support team will contact you."
 
-Respond ONLY with a JSON object containing two keys: "translation" and "answer". Do not include any formatting, markdown wrappers, backticks, or explanation.
-Example Output:
-{
-  "translation": "Hello, when will my internet be restored?",
-  "answer": "The service is expected to be restored by 4:00 PM today."
-}
+Respond ONLY with a JSON object containing the keys "translation" and "answer". Do not include any formatting, markdown wrappers, backticks, or explanation.
 
-Kannada Text:
+Input Text:
 ${text}
 `;
 
@@ -159,7 +162,7 @@ ${text}
         messages: [
           {
             role: "user",
-            content: prompt, 
+            content: prompt,
           },
         ],
       }),
@@ -201,6 +204,45 @@ ${text}
 //   3. Store in FILE 1 (transcript) always
 //   4. If answer !== null → store { customer: translation, agent: answer } in FILE 2
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// translateText — simple translation helper for Agent speech
+// ─────────────────────────────────────────────────────────────────────────────
+async function translateText(text, callLogger) {
+  try {
+    const prompt = `Translate the following text into clean, grammatical English. 
+Note: The text may be in Kannada script, English script, or Kannada transliterated/written in the English alphabet (e.g., "Namaskara", "nana hesaru", "bandiddini"). Translate all Kannada words accurately to English.
+Respond ONLY with the English translation. Do not include any explanations, markdown wrappers, or backticks.
+
+Text:
+${text}`;
+
+    const command = new InvokeModelCommand({
+      modelId: "google.gemma-3-4b-it",
+      contentType: "application/json",
+      accept: "application/json",
+      body: JSON.stringify({
+        max_tokens: 300,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+      }),
+    });
+
+    const response = await bedrock.send(command);
+    const body = JSON.parse(Buffer.from(response.body).toString());
+    return body.choices[0].message.content.trim();
+  } catch (err) {
+    callLogger.error("translateText failed", err);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// startTranscribe — corrected pipeline flow with speaker separation
+// ─────────────────────────────────────────────────────────────────────────────
 async function startTranscribe(
   audioStreamGenerator,
   sampleRateHertz,
@@ -208,21 +250,23 @@ async function startTranscribe(
   agentExchanges,     // FILE 2
   sessionMeta,
   callId,
-  callLogger          // per-session logger
+  callLogger,         // per-session logger
+  speaker             // "customer" or "agent"
 ) {
   callLogger.log(
-    `Transcribe starting | lang=${sessionMeta.language} | encoding=${sessionMeta.media_type} | sampleRate=${sampleRateHertz}Hz`
+    `Transcribe starting for [${speaker.toUpperCase()}] | auto-identify (kn-IN/en-IN) | encoding=${sessionMeta.media_type} | sampleRate=${sampleRateHertz}Hz`
   );
 
   const command = new StartStreamTranscriptionCommand({
-    LanguageCode: sessionMeta.language,
+    IdentifyLanguage: true,
+    LanguageOptions: "kn-IN,en-IN",
     MediaEncoding: sessionMeta.media_type,
     MediaSampleRateHertz: sampleRateHertz,
     AudioStream: audioStreamGenerator,
   });
 
   const response = await transcribeClient.send(command);
-  callLogger.log("Transcribe stream open");
+  callLogger.log(`Transcribe stream open for [${speaker.toUpperCase()}]`);
 
   for await (const event of response.TranscriptResultStream) {
     if (!event.TranscriptEvent) continue;
@@ -232,13 +276,35 @@ async function startTranscribe(
       const kannadaText = r.Alternatives[0].Transcript;
 
       if (r.IsPartial) {
-        callLogger.log(`partial transcript: ${kannadaText}`);
+        callLogger.log(`partial transcript [${speaker.toUpperCase()}]: ${kannadaText}`);
         continue;
       }
 
-      console.log(`[${callId}] FINAL (KN): ${kannadaText}`);
-      callLogger.log(`FINAL (KN): ${kannadaText}`);
+      console.log(`[${callId}] [${speaker.toUpperCase()}] FINAL (KN): ${kannadaText}`);
+      callLogger.log(`[${speaker.toUpperCase()}] FINAL (KN): ${kannadaText}`);
 
+      if (speaker === "agent") {
+        // Simple translation for Support Agent voice (no Q&A, no filter)
+        callLogger.log(`translating Agent speech: "${kannadaText}"`);
+        const translation = await translateText(kannadaText, callLogger);
+
+        console.log(`[${callId}] [${speaker.toUpperCase()}] FINAL (EN): ${translation}`);
+        callLogger.log(`[${speaker.toUpperCase()}] FINAL (EN): ${translation}`);
+
+        transcriptEntries.push({
+          timestamp: new Date().toISOString(),
+          speaker: "support",
+          language: sessionMeta.language,
+          kannada: kannadaText,
+          english: translation,
+          answer: null,
+          media_type: sessionMeta.media_type,
+          sample_rate_hertz: sampleRateHertz,
+        });
+        continue;
+      }
+
+      // ── CUSTOMER PIPELINE ──
       // ── STEP 1: Local pre-filter (free, fast) ──
       const passesLocalFilter = shouldProcessTranscription(kannadaText);
 
@@ -247,6 +313,7 @@ async function startTranscribe(
         callLogger.log(`Local filter blocked: "${kannadaText}"`);
         transcriptEntries.push({
           timestamp: new Date().toISOString(),
+          speaker: "customer",
           language: sessionMeta.language,
           kannada: kannadaText,
           english: null,
@@ -259,7 +326,7 @@ async function startTranscribe(
       }
 
       // ── STEP 2: Combined translate + topic-match LLM call ──
-      callLogger.log(`sending to translateAndProcessQuery: ${kannadaText}`);
+      callLogger.log(`sending customer query to translateAndProcessQuery: ${kannadaText}`);
       const result = await translateAndProcessQuery(kannadaText, callLogger);
 
       if (!result) {
@@ -267,6 +334,7 @@ async function startTranscribe(
         callLogger.log(`translateAndProcessQuery returned null for: "${kannadaText}"`);
         transcriptEntries.push({
           timestamp: new Date().toISOString(),
+          speaker: "customer",
           language: sessionMeta.language,
           kannada: kannadaText,
           english: null,
@@ -279,14 +347,15 @@ async function startTranscribe(
       }
 
       const { translation, answer } = result;
-      console.log(`[${callId}] FINAL (EN): ${translation}`);
-      console.log(`[${callId}] 🤖 Agent answer: ${answer}`);
-      callLogger.log(`FINAL (EN): ${translation}`);
-      callLogger.log(`Agent answer: ${answer}`);
+      console.log(`[${callId}] [CUSTOMER] FINAL (EN): ${translation}`);
+      console.log(`[${callId}] 🤖 Suggested agent answer: ${answer}`);
+      callLogger.log(`[CUSTOMER] FINAL (EN): ${translation}`);
+      callLogger.log(`Suggested agent answer: ${answer}`);
 
       // ── STEP 3: Always store in FILE 1 (full transcript) ──
       transcriptEntries.push({
         timestamp: new Date().toISOString(),
+        speaker: "customer",
         language: sessionMeta.language,
         kannada: kannadaText,
         english: translation,
@@ -309,21 +378,18 @@ async function startTranscribe(
     }
   }
 
-  callLogger.log("Transcribe stream closed");
+  callLogger.log(`Transcribe stream closed for [${speaker.toUpperCase()}]`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // finalizeCall — guaranteed teardown order
-//   1. Flush audio file
-//   2. Await Transcribe + all LLM calls
-//   3. Write FILE 1: transcript-<callId>.json
-//   4. Write FILE 2: conversation-<callId>.json
-//   5. Close call logger
 // ─────────────────────────────────────────────────────────────────────────────
 async function finalizeCall({
   callId,
-  audioFile,
-  transcribePromise,
+  customerAudioFile,
+  agentAudioFile,
+  customerTranscribePromise,
+  agentTranscribePromise,
   transcriptEntries,
   agentExchanges,
   transcriptPath,
@@ -337,24 +403,40 @@ async function finalizeCall({
 
   callLogger.log("Finalizing call...");
 
-  // Step 1 — flush audio file
-  await new Promise((resolve) => {
-    if (audioFile.writableEnded) resolve();
-    else audioFile.end(resolve);
-  });
-  callLogger.log("Audio file flushed");
+  // Step 1 — flush audio files
+  await Promise.all([
+    new Promise((resolve) => {
+      if (customerAudioFile.writableEnded) resolve();
+      else customerAudioFile.end(resolve);
+    }),
+    new Promise((resolve) => {
+      if (agentAudioFile.writableEnded) resolve();
+      else agentAudioFile.end(resolve);
+    })
+  ]);
+  callLogger.log("Audio files flushed");
 
   // Step 2 — wait for Transcribe + all LLM calls
-  if (transcribePromise) {
+  if (customerTranscribePromise) {
     try {
-      await transcribePromise;
+      await customerTranscribePromise;
     } catch (err) {
-      callLogger.error("Transcribe error during finalize", err);
-      console.error(`[${callId}] ⚠️  Transcribe error: ${err.message || err}`);
+      callLogger.error("Customer Transcribe error during finalize", err);
+      console.error(`[${callId}] ⚠️ Customer Transcribe error: ${err.message || err}`);
     }
   } else {
-    callLogger.log("WARNING: No Transcribe session was started");
-    console.warn(`[${callId}] ⚠️  No Transcribe session started`);
+    callLogger.log("WARNING: No Customer Transcribe session was started");
+  }
+
+  if (agentTranscribePromise) {
+    try {
+      await agentTranscribePromise;
+    } catch (err) {
+      callLogger.error("Agent Transcribe error during finalize", err);
+      console.error(`[${callId}] ⚠️ Agent Transcribe error: ${err.message || err}`);
+    }
+  } else {
+    callLogger.log("WARNING: No Agent Transcribe session was started");
   }
 
   // Step 3 — FILE 1: full transcript
@@ -385,43 +467,74 @@ async function finalizeCall({
 // ─────────────────────────────────────────────────────────────────────────────
 const wss = new WebSocket.Server({ port: PORT });
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
 
-  const callId           = `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-  const audioPath        = `${CALLS_DIR}/audio-${callId}.raw`;
-  const transcriptPath   = `${CALLS_DIR}/transcript-${callId}.json`;
+  const callId = `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+  const customerAudioPath = `${CALLS_DIR}/audio-${callId}-customer.raw`;
+  const agentAudioPath = `${CALLS_DIR}/audio-${callId}-agent.raw`;
+  const transcriptPath = `${CALLS_DIR}/transcript-${callId}.json`;
   const conversationPath = `${CALLS_DIR}/conversation-${callId}.json`;
+
+  // Parse connection direction (inbound vs outbound) from query parameter
+  const requestUrl = req ? req.url : "/";
+  const urlParams = new URL(requestUrl, "http://localhost").searchParams;
+  const direction = urlParams.get("direction") || "inbound";
+
+  // Resolve customer vs support agent track based on call direction
+  const customerTrack = direction === "outbound" ? "outbound" : "inbound";
+  const agentTrack = direction === "outbound" ? "inbound" : "outbound";
 
   // Per-session logger — writes to logs/call_<callId>.log
   const callLogger = new CallLogger(callId);
 
-  callLogger.log("New connection");
+  callLogger.log(`New connection | direction=${direction} | customerTrack=${customerTrack} | agentTrack=${agentTrack}`);
 
-  const audioFile         = fs.createWriteStream(audioPath);
+  // Ensure CALLS_DIR exists dynamically
+  if (!fs.existsSync(CALLS_DIR)) {
+    fs.mkdirSync(CALLS_DIR, { recursive: true });
+  }
+
+  const customerAudioFile = fs.createWriteStream(customerAudioPath);
+  const agentAudioFile = fs.createWriteStream(agentAudioPath);
   const transcriptEntries = [];
-  const agentExchanges    = [];
+  const agentExchanges = [];
 
   const callMeta = {
-    language:          "kn-IN",
-    media_type:        "pcm",
+    language: "kn-IN",
+    media_type: "pcm",
     sample_rate_hertz: null,
   };
 
-  const audioQueue      = [];
-  let streamEnded       = false;
+  const customerQueue = [];
+  const agentQueue = [];
+  let streamEnded = false;
   let transcribeStarted = false;
-  let transcribePromise = null;
+  let customerTranscribePromise = null;
+  let agentTranscribePromise = null;
 
-  let _persisted      = false;
-  const isPersisted   = () => _persisted;
+  let _persisted = false;
+  const isPersisted = () => _persisted;
   const markPersisted = () => { _persisted = true; };
 
-  async function* audioStream() {
+  async function* customerAudioStream() {
     while (true) {
-      if (audioQueue.length > 0) {
-        yield { AudioEvent: { AudioChunk: audioQueue.shift() } };
+      if (customerQueue.length > 0) {
+        yield { AudioEvent: { AudioChunk: customerQueue.shift() } };
       } else if (streamEnded) {
-        callLogger.log("Audio generator exhausted");
+        callLogger.log("Customer Audio generator exhausted");
+        return;
+      } else {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+  }
+
+  async function* agentAudioStream() {
+    while (true) {
+      if (agentQueue.length > 0) {
+        yield { AudioEvent: { AudioChunk: agentQueue.shift() } };
+      } else if (streamEnded) {
+        callLogger.log("Agent Audio generator exhausted");
         return;
       } else {
         await new Promise((r) => setTimeout(r, 50));
@@ -433,8 +546,10 @@ wss.on("connection", (ws) => {
     streamEnded = true;
     finalizeCall({
       callId,
-      audioFile,
-      transcribePromise,
+      customerAudioFile,
+      agentAudioFile,
+      customerTranscribePromise,
+      agentTranscribePromise,
       transcriptEntries,
       agentExchanges,
       transcriptPath,
@@ -453,7 +568,8 @@ wss.on("connection", (ws) => {
       const rawText = msg.toString();
       const data = JSON.parse(rawText);
       if (data.event === "media") {
-        callLogger.log('incoming message: {"event":"media"}');
+        const track = data.media && data.media.track;
+        callLogger.log(`incoming message: {"event":"media", "track":"${track || ""}"}`);
       } else {
         callLogger.log(`incoming message: ${rawText}`);
       }
@@ -465,8 +581,8 @@ wss.on("connection", (ws) => {
 
         case "start": {
           callLogger.log(`received start event: ${JSON.stringify(data)}`);
-          const mediaFormat     = data.start && data.start.media_format;
-          const rawRate         = mediaFormat && (mediaFormat.sampleRate || mediaFormat.sample_rate);
+          const mediaFormat = data.start && data.start.media_format;
+          const rawRate = mediaFormat && (mediaFormat.sampleRate || mediaFormat.sample_rate);
           const sampleRateHertz = rawRate ? Number(rawRate) : null;
 
           if (!sampleRateHertz || isNaN(sampleRateHertz)) {
@@ -483,24 +599,48 @@ wss.on("connection", (ws) => {
             const frozenMeta = Object.freeze({ ...callMeta });
             const lockedRate = callMeta.sample_rate_hertz;
 
-            transcribePromise = startTranscribe(
-              audioStream(),
+            customerTranscribePromise = startTranscribe(
+              customerAudioStream(),
               lockedRate,
               transcriptEntries,
               agentExchanges,
               frozenMeta,
               callId,
-              callLogger
+              callLogger,
+              "customer"
             );
-            transcribePromise.catch(() => {});
+            customerTranscribePromise.catch(() => { });
+
+            agentTranscribePromise = startTranscribe(
+              agentAudioStream(),
+              lockedRate,
+              transcriptEntries,
+              agentExchanges,
+              frozenMeta,
+              callId,
+              callLogger,
+              "agent"
+            );
+            agentTranscribePromise.catch(() => { });
           }
           break;
         }
 
         case "media": {
+          const track = data.media && data.media.track;
           const audioBuffer = Buffer.from(data.media.payload, "base64");
-          audioFile.write(audioBuffer);
-          audioQueue.push(audioBuffer);
+
+          if (track === customerTrack) {
+            customerAudioFile.write(audioBuffer);
+            customerQueue.push(audioBuffer);
+          } else if (track === agentTrack) {
+            agentAudioFile.write(audioBuffer);
+            agentQueue.push(audioBuffer);
+          } else {
+            // Default fallback if no track is specified (standard mono streaming test)
+            customerAudioFile.write(audioBuffer);
+            customerQueue.push(audioBuffer);
+          }
           break;
         }
 
