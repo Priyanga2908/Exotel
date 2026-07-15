@@ -11,16 +11,30 @@ const {
   BedrockRuntimeClient,
   InvokeModelCommand,
 } = require("@aws-sdk/client-bedrock-runtime");
+const {
+  S3Client,
+  PutObjectCommand,
+} = require("@aws-sdk/client-s3");
 
-const PORT = 8080;
+// ── Environment-driven config (defaults are for LOCAL DEV only) ───────────
+const PORT = process.env.PORT || 8080;
+const AWS_REGION = process.env.AWS_REGION || "us-east-1";
+const S3_BUCKET = process.env.S3_BUCKET || "tohand-recordings";
+const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID || "google.gemma-3-4b-it";
+
 const CALLS_DIR = "calls";
 
 // ── Shared AWS SDK clients (stateless — safe to reuse across connections) ──
+// In ECS these automatically pick up temporary credentials from the Task Role.
+// No access keys are ever read or hardcoded here.
 const transcribeClient = new TranscribeStreamingClient({
-  region: process.env.AWS_REGION,
+  region: AWS_REGION,
 });
 const bedrock = new BedrockRuntimeClient({
-  region: process.env.AWS_REGION,
+  region: AWS_REGION,
+});
+const s3 = new S3Client({
+  region: AWS_REGION,
 });
 
 if (!fs.existsSync(CALLS_DIR)) {
@@ -31,6 +45,32 @@ process.on("unhandledRejection", (reason) => {
   console.error("UNHANDLED REJECTION:");
   console.dir(reason, { depth: null });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// uploadToS3 — uploads a local file to S3 under the given key.
+// Never throws — logs and resolves so it can never break call teardown.
+// ─────────────────────────────────────────────────────────────────────────────
+async function uploadToS3(localFilePath, s3Key, contentType, callLogger) {
+  try {
+    const fileBuffer = fs.readFileSync(localFilePath);
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: s3Key,
+        Body: fileBuffer,
+        ContentType: contentType,
+      })
+    );
+
+    callLogger.log(`S3 upload OK | s3://${S3_BUCKET}/${s3Key}`);
+    return true;
+  } catch (err) {
+    callLogger.error(`S3 upload FAILED for key "${s3Key}"`, err);
+    console.error(`❌ S3 upload failed for ${s3Key}:`, err.message || err);
+    return false;
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CallLogger — per-session file logger
@@ -154,7 +194,7 @@ ${text}
 `;
 
     const command = new InvokeModelCommand({
-      modelId: "google.gemma-3-4b-it",
+      modelId: BEDROCK_MODEL_ID,
       contentType: "application/json",
       accept: "application/json",
       body: JSON.stringify({
@@ -217,7 +257,7 @@ Text:
 ${text}`;
 
     const command = new InvokeModelCommand({
-      modelId: "google.gemma-3-4b-it",
+      modelId: BEDROCK_MODEL_ID,
       contentType: "application/json",
       accept: "application/json",
       body: JSON.stringify({
@@ -439,19 +479,25 @@ async function finalizeCall({
     callLogger.log("WARNING: No Agent Transcribe session was started");
   }
 
-  // Step 3 — FILE 1: full transcript
+  // Step 3 — FILE 1: full transcript (write locally, then upload to S3)
   try {
     fs.writeFileSync(transcriptPath, JSON.stringify(transcriptEntries, null, 2));
     callLogger.log(`FILE 1 saved | ${transcriptEntries.length} entries → ${transcriptPath}`);
+
+    const transcriptKey = `calls/${callId}/transcript-${callId}.json`;
+    await uploadToS3(transcriptPath, transcriptKey, "application/json", callLogger);
   } catch (err) {
     callLogger.error("FILE 1 write failed", err);
     console.error(`[${callId}] ❌ FILE 1 write failed:`, err);
   }
 
-  // Step 4 — FILE 2: agent exchanges
+  // Step 4 — FILE 2: agent exchanges (write locally, then upload to S3)
   try {
     fs.writeFileSync(conversationPath, JSON.stringify(agentExchanges, null, 2));
     callLogger.log(`FILE 2 saved | ${agentExchanges.length} exchanges → ${conversationPath}`);
+
+    const conversationKey = `calls/${callId}/conversation-${callId}.json`;
+    await uploadToS3(conversationPath, conversationKey, "application/json", callLogger);
   } catch (err) {
     callLogger.error("FILE 2 write failed", err);
     console.error(`[${callId}] ❌ FILE 2 write failed:`, err);
@@ -670,4 +716,4 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-console.log(`🚀 WebSocket server running on ws://localhost:${PORT}`);
+console.log(`🚀 WebSocket server running on ws://localhost:${PORT} | S3_BUCKET=${S3_BUCKET} | AWS_REGION=${AWS_REGION}`);
