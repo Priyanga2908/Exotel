@@ -11,8 +11,10 @@
   "description": "",
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.1073.0",
+    "@aws-sdk/client-dynamodb": "^3.1087.0",
     "@aws-sdk/client-s3": "^3.1087.0",
     "@aws-sdk/client-transcribe-streaming": "^3.1072.0",
+    "@aws-sdk/lib-dynamodb": "^3.1087.0",
     "alawmulaw": "^6.0.0",
     "aws-sdk": "^2.1693.0",
     "dotenv": "^17.4.2",

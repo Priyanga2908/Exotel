@@ -5,7 +5,7 @@ const path = require("path");
 const WebSocket = require("ws");
 const {
   TranscribeStreamingClient,
-  StartStreamTranscriptionCommand,
+  StartCallAnalyticsStreamTranscriptionCommand,
 } = require("@aws-sdk/client-transcribe-streaming");
 const {
   BedrockRuntimeClient,
@@ -15,11 +15,18 @@ const {
   S3Client,
   PutObjectCommand,
 } = require("@aws-sdk/client-s3");
+const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+const {
+  DynamoDBDocumentClient,
+  GetCommand,
+  UpdateCommand,
+} = require("@aws-sdk/lib-dynamodb");
 
 // ── Environment-driven config (defaults are for LOCAL DEV only) ───────────
 const PORT = process.env.PORT || 8080;
 const AWS_REGION = process.env.AWS_REGION || "us-east-1";
 const S3_BUCKET = process.env.S3_BUCKET || "tohand-recordings";
+const DYNAMODB_TABLE = process.env.DYNAMODB_TABLE || "tohand-table";
 const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID || "google.gemma-3-4b-it";
 
 const CALLS_DIR = "calls";
@@ -36,6 +43,10 @@ const bedrock = new BedrockRuntimeClient({
 const s3 = new S3Client({
   region: AWS_REGION,
 });
+const dbClient = new DynamoDBClient({
+  region: AWS_REGION,
+});
+const docClient = DynamoDBDocumentClient.from(dbClient);
 
 if (!fs.existsSync(CALLS_DIR)) {
   fs.mkdirSync(CALLS_DIR, { recursive: true });
@@ -45,6 +56,107 @@ process.on("unhandledRejection", (reason) => {
   console.error("UNHANDLED REJECTION:");
   console.dir(reason, { depth: null });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DynamoDB & Bedrock helpers for Customer Profile tracking and Call History
+// ─────────────────────────────────────────────────────────────────────────────
+async function getCustomerProfile(phoneNumber, callLogger) {
+  try {
+    const response = await docClient.send(
+      new GetCommand({
+        TableName: DYNAMODB_TABLE,
+        Key: { PhoneNumber: phoneNumber },
+      })
+    );
+    return response.Item || null;
+  } catch (err) {
+    callLogger.error(`getCustomerProfile failed for ${phoneNumber}`, err);
+    return null;
+  }
+}
+
+async function updateCustomerProfile(phoneNumber, callSid, summary, callLogger) {
+  try {
+    const timestamp = new Date().toISOString();
+    const newHistoryEntry = {
+      CallSid: callSid,
+      Timestamp: timestamp,
+      Summary: summary
+    };
+
+    await docClient.send(
+      new UpdateCommand({
+        TableName: DYNAMODB_TABLE,
+        Key: { PhoneNumber: phoneNumber },
+        UpdateExpression: "SET CallHistory = list_append(if_not_exists(CallHistory, :empty_list), :new_entry)",
+        ExpressionAttributeValues: {
+          ":empty_list": [],
+          ":new_entry": [newHistoryEntry]
+        }
+      })
+    );
+    callLogger.log(`DynamoDB profile updated for ${phoneNumber} with CallSid ${callSid}`);
+    return true;
+  } catch (err) {
+    callLogger.error(`updateCustomerProfile failed for ${phoneNumber}`, err);
+    return false;
+  }
+}
+
+async function generateCallSummary(transcriptEntries, callLogger) {
+  try {
+    if (!transcriptEntries || transcriptEntries.length === 0) {
+      return "No conversation recorded.";
+    }
+
+    const formattedTranscript = transcriptEntries
+      .map(entry => `[${entry.speaker.toUpperCase()}]: ${entry.english || entry.kannada}`)
+      .join("\n");
+
+    const prompt = `You are a customer support summary generator. Below is the transcript of a call between a customer and support.
+Summarize the main issue discussed in the call and the resolution or action items in exactly 1 or 2 sentences. Keep it very concise and professional. Do not add any conversational preamble or metadata.
+
+Transcript:
+${formattedTranscript}`;
+
+    const command = new InvokeModelCommand({
+      modelId: BEDROCK_MODEL_ID,
+      contentType: "application/json",
+      accept: "application/json",
+      body: JSON.stringify({
+        max_tokens: 200,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+      }),
+    });
+
+    const response = await bedrock.send(command);
+    const body = JSON.parse(Buffer.from(response.body).toString());
+    return body.choices[0].message.content.trim();
+  } catch (err) {
+    callLogger.error("generateCallSummary failed", err);
+    return "Call occurred but summary generation failed.";
+  }
+}
+
+function splitStereoBuffer(stereoBuffer) {
+  const totalFrames = Math.floor(stereoBuffer.length / 4);
+  const customerBuffer = Buffer.alloc(totalFrames * 2);
+  const supportBuffer = Buffer.alloc(totalFrames * 2);
+
+  for (let i = 0; i < totalFrames; i++) {
+    // Copy 2 bytes of left channel (Channel 0: Customer)
+    stereoBuffer.copy(customerBuffer, i * 2, i * 4, i * 4 + 2);
+    // Copy 2 bytes of right channel (Channel 1: Agent)
+    stereoBuffer.copy(supportBuffer, i * 2, i * 4 + 2, i * 4 + 4);
+  }
+
+  return { customerBuffer, supportBuffer };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // uploadToS3 — uploads a local file to S3 under the given key.
@@ -155,10 +267,11 @@ function shouldProcessTranscription(text) {
 //   answer      — pre-defined topic reply if matched, or fallback string,
 //                 or null if not a support query at all
 // ─────────────────────────────────────────────────────────────────────────────
-async function translateAndProcessQuery(text, callLogger) {
+async function translateAndProcessQuery(text, historyContext, callLogger) {
   try {
     const prompt = `
 You are a customer support AI assistant. You will be provided with a transcript from a call. The transcript may be in Kannada characters, English characters, or Kannada transliterated/written using the English alphabet (e.g. "Namaskara", "hesaru", "nana", "bandiddini", "bandardini", "ivattu", "hege").
+${historyContext ? `\nHere is the customer's profile and last call history for reference. You can use it if they reference a previous call or ask about past tickets:\n${historyContext}\n` : ""}
 
 Your task is to perform two steps:
 1. Translate the input text accurately to English. If the text contains Kannada words (even if written in the English alphabet), translate them to their actual English meanings. 
@@ -291,15 +404,16 @@ async function startTranscribe(
   sessionMeta,
   callId,
   callLogger,         // per-session logger
-  speaker             // "customer" or "agent"
+  speaker,            // "customer" or "agent"
+  historyContextPromise // customer history context Promise
 ) {
   callLogger.log(
     `Transcribe starting for [${speaker.toUpperCase()}] | auto-identify (kn-IN/en-IN) | encoding=${sessionMeta.media_type} | sampleRate=${sampleRateHertz}Hz`
   );
 
-  const command = new StartStreamTranscriptionCommand({
+  const command = new StartCallAnalyticsStreamTranscriptionCommand({
     IdentifyLanguage: true,
-    LanguageOptions: "kn-IN,en-IN",
+    LanguageOptions: "en-US,es-US",
     MediaEncoding: sessionMeta.media_type,
     MediaSampleRateHertz: sampleRateHertz,
     AudioStream: audioStreamGenerator,
@@ -308,113 +422,132 @@ async function startTranscribe(
   const response = await transcribeClient.send(command);
   callLogger.log(`Transcribe stream open for [${speaker.toUpperCase()}]`);
 
-  for await (const event of response.TranscriptResultStream) {
-    if (!event.TranscriptEvent) continue;
+  for await (const event of response.CallAnalyticsTranscriptResultStream) {
+    if (!event.UtteranceEvent) continue;
 
-    const results = event.TranscriptEvent.Transcript.Results;
-    for (const r of results) {
-      const kannadaText = r.Alternatives[0].Transcript;
+    const utterance = event.UtteranceEvent;
+    const kannadaText = utterance.Transcript !== undefined ? utterance.Transcript : utterance.transcript;
+    if (!kannadaText || !kannadaText.trim()) {
+      callLogger.log(`Skipping empty/undefined utterance event [${speaker.toUpperCase()}]`);
+      continue;
+    }
+    const languageCode = utterance.LanguageCode !== undefined ? utterance.LanguageCode : (utterance.languageCode || sessionMeta.language);
 
-      if (r.IsPartial) {
-        callLogger.log(`partial transcript [${speaker.toUpperCase()}]: ${kannadaText}`);
-        continue;
-      }
+    if (utterance.IsPartial || utterance.isPartial) {
+      callLogger.log(`partial transcript [${speaker.toUpperCase()}]: ${kannadaText}`);
+      continue;
+    }
 
-      console.log(`[${callId}] [${speaker.toUpperCase()}] FINAL (KN): ${kannadaText}`);
-      callLogger.log(`[${speaker.toUpperCase()}] FINAL (KN): ${kannadaText}`);
+    console.log(`[${callId}] [${speaker.toUpperCase()}] FINAL (KN): ${kannadaText}`);
+    callLogger.log(`[${speaker.toUpperCase()}] FINAL (KN): ${kannadaText}`);
 
-      if (speaker === "agent") {
-        // Simple translation for Support Agent voice (no Q&A, no filter)
-        callLogger.log(`translating Agent speech: "${kannadaText}"`);
-        const translation = await translateText(kannadaText, callLogger);
+    if (speaker === "agent") {
+      // Simple translation for Support Agent voice (no Q&A, no filter)
+      callLogger.log(`translating Support Agent speech: "${kannadaText}"`);
+      const translation = await translateText(kannadaText, callLogger);
 
-        console.log(`[${callId}] [${speaker.toUpperCase()}] FINAL (EN): ${translation}`);
-        callLogger.log(`[${speaker.toUpperCase()}] FINAL (EN): ${translation}`);
+      console.log(`[${callId}] [SUPPORT] FINAL (EN): ${translation}`);
+      callLogger.log(`[SUPPORT] FINAL (EN): ${translation}`);
 
-        transcriptEntries.push({
-          timestamp: new Date().toISOString(),
-          speaker: "support",
-          language: sessionMeta.language,
-          kannada: kannadaText,
-          english: translation,
-          answer: null,
-          media_type: sessionMeta.media_type,
-          sample_rate_hertz: sampleRateHertz,
-        });
-        continue;
-      }
-
-      // ── CUSTOMER PIPELINE ──
-      // ── STEP 1: Local pre-filter (free, fast) ──
-      const passesLocalFilter = shouldProcessTranscription(kannadaText);
-
-      if (!passesLocalFilter) {
-        // Filler/greeting — store in transcript but skip LLM entirely
-        callLogger.log(`Local filter blocked: "${kannadaText}"`);
-        transcriptEntries.push({
-          timestamp: new Date().toISOString(),
-          speaker: "customer",
-          language: sessionMeta.language,
-          kannada: kannadaText,
-          english: null,
-          answer: null,
-          filtered_by: "local",
-          media_type: sessionMeta.media_type,
-          sample_rate_hertz: sampleRateHertz,
-        });
-        continue;
-      }
-
-      // ── STEP 2: Combined translate + topic-match LLM call ──
-      callLogger.log(`sending customer query to translateAndProcessQuery: ${kannadaText}`);
-      const result = await translateAndProcessQuery(kannadaText, callLogger);
-
-      if (!result) {
-        // LLM call failed — still store raw in transcript
-        callLogger.log(`translateAndProcessQuery returned null for: "${kannadaText}"`);
-        transcriptEntries.push({
-          timestamp: new Date().toISOString(),
-          speaker: "customer",
-          language: sessionMeta.language,
-          kannada: kannadaText,
-          english: null,
-          answer: null,
-          filtered_by: "llm_error",
-          media_type: sessionMeta.media_type,
-          sample_rate_hertz: sampleRateHertz,
-        });
-        continue;
-      }
-
-      const { translation, answer } = result;
-      console.log(`[${callId}] [CUSTOMER] FINAL (EN): ${translation}`);
-      console.log(`[${callId}] 🤖 Suggested agent answer: ${answer}`);
-      callLogger.log(`[CUSTOMER] FINAL (EN): ${translation}`);
-      callLogger.log(`Suggested agent answer: ${answer}`);
-
-      // ── STEP 3: Always store in FILE 1 (full transcript) ──
+      // Store in FILE 1 (transcript)
       transcriptEntries.push({
         timestamp: new Date().toISOString(),
-        speaker: "customer",
-        language: sessionMeta.language,
+        speaker: "support",
+        language: languageCode,
         kannada: kannadaText,
         english: translation,
-        answer: answer,
+        answer: null,
         media_type: sessionMeta.media_type,
         sample_rate_hertz: sampleRateHertz,
       });
 
-      // ── STEP 4: If answer exists → store in FILE 2 (agent exchanges) ──
-      if (answer !== null && answer !== undefined) {
-        agentExchanges.push({
-          timestamp: new Date().toISOString(),
-          customer: translation,
-          agent: answer,
-        });
-        callLogger.log(`Exchange stored — customer: "${translation}" | agent: "${answer}"`);
-      } else {
-        callLogger.log(`No agent answer (not a support query) — not stored in FILE 2`);
-      }
+      // Store in FILE 2 (conversation)
+      agentExchanges.push({
+        timestamp: new Date().toISOString(),
+        role: "support",
+        text: translation,
+      });
+      continue;
+    }
+
+    // ── CUSTOMER PIPELINE ──
+    // ── STEP 1: Local pre-filter (free, fast) ──
+    const passesLocalFilter = shouldProcessTranscription(kannadaText);
+
+    if (!passesLocalFilter) {
+      // Filler/greeting — store in transcript but skip LLM entirely
+      callLogger.log(`Local filter blocked: "${kannadaText}"`);
+      transcriptEntries.push({
+        timestamp: new Date().toISOString(),
+        speaker: "customer",
+        language: languageCode,
+        kannada: kannadaText,
+        english: null,
+        answer: null,
+        filtered_by: "local",
+        media_type: sessionMeta.media_type,
+        sample_rate_hertz: sampleRateHertz,
+      });
+      continue;
+    }
+
+    // ── STEP 2: Combined translate + topic-match LLM call ──
+    callLogger.log(`sending customer query to translateAndProcessQuery: ${kannadaText}`);
+    const historyContext = historyContextPromise ? await historyContextPromise : "";
+    const result = await translateAndProcessQuery(kannadaText, historyContext, callLogger);
+
+    if (!result) {
+      // LLM call failed — still store raw in transcript
+      callLogger.log(`translateAndProcessQuery returned null for: "${kannadaText}"`);
+      transcriptEntries.push({
+        timestamp: new Date().toISOString(),
+        speaker: "customer",
+        language: languageCode,
+        kannada: kannadaText,
+        english: null,
+        answer: null,
+        filtered_by: "llm_error",
+        media_type: sessionMeta.media_type,
+        sample_rate_hertz: sampleRateHertz,
+      });
+      continue;
+    }
+
+    const { translation, answer } = result;
+    console.log(`[${callId}] [CUSTOMER] FINAL (EN): ${translation}`);
+    callLogger.log(`[CUSTOMER] FINAL (EN): ${translation}`);
+
+    // Store in FILE 1 (transcript)
+    transcriptEntries.push({
+      timestamp: new Date().toISOString(),
+      speaker: "customer",
+      language: languageCode,
+      kannada: kannadaText,
+      english: translation,
+      answer: answer,
+      media_type: sessionMeta.media_type,
+      sample_rate_hertz: sampleRateHertz,
+    });
+
+    // Store in FILE 2 (conversation) - customer statement
+    agentExchanges.push({
+      timestamp: new Date().toISOString(),
+      role: "customer",
+      text: translation,
+    });
+
+    // If answer exists → store in FILE 2 (conversation) - agent response
+    if (answer !== null && answer !== undefined) {
+      console.log(`[${callId}] [AGENT] SUGGESTED ANSWER: ${answer}`);
+      callLogger.log(`[AGENT] SUGGESTED ANSWER: ${answer}`);
+      agentExchanges.push({
+        timestamp: new Date().toISOString(),
+        role: "agent",
+        text: answer,
+      });
+      callLogger.log(`Exchange stored — customer: "${translation}" | agent: "${answer}"`);
+    } else {
+      callLogger.log(`No agent answer (not a support query) — only customer text stored`);
     }
   }
 
@@ -427,7 +560,9 @@ async function startTranscribe(
 async function finalizeCall({
   callId,
   customerAudioFile,
-  agentAudioFile,
+  supportAudioFile,
+  customerAudioPath,
+  supportAudioPath,
   customerTranscribePromise,
   agentTranscribePromise,
   transcriptEntries,
@@ -437,6 +572,8 @@ async function finalizeCall({
   callLogger,
   isPersisted,
   markPersisted,
+  customerPhone,
+  historyContextPromise,
 }) {
   if (isPersisted()) return;
   markPersisted();
@@ -450,9 +587,9 @@ async function finalizeCall({
       else customerAudioFile.end(resolve);
     }),
     new Promise((resolve) => {
-      if (agentAudioFile.writableEnded) resolve();
-      else agentAudioFile.end(resolve);
-    })
+      if (supportAudioFile.writableEnded) resolve();
+      else supportAudioFile.end(resolve);
+    }),
   ]);
   callLogger.log("Audio files flushed");
 
@@ -463,6 +600,8 @@ async function finalizeCall({
     } catch (err) {
       callLogger.error("Customer Transcribe error during finalize", err);
       console.error(`[${callId}] ⚠️ Customer Transcribe error: ${err.message || err}`);
+      const util = require("util");
+      console.error(`[${callId}] Detailed error:`, util.inspect(err, { showHidden: true, depth: 3 }));
     }
   } else {
     callLogger.log("WARNING: No Customer Transcribe session was started");
@@ -474,36 +613,76 @@ async function finalizeCall({
     } catch (err) {
       callLogger.error("Agent Transcribe error during finalize", err);
       console.error(`[${callId}] ⚠️ Agent Transcribe error: ${err.message || err}`);
+      const util = require("util");
+      console.error(`[${callId}] Detailed error:`, util.inspect(err, { showHidden: true, depth: 3 }));
     }
   } else {
     callLogger.log("WARNING: No Agent Transcribe session was started");
   }
 
-  // Step 3 — FILE 1: full transcript (write locally, then upload to S3)
+  // Step 3 — Write full transcript locally (FILE 1) - do NOT upload to S3
   try {
     fs.writeFileSync(transcriptPath, JSON.stringify(transcriptEntries, null, 2));
-    callLogger.log(`FILE 1 saved | ${transcriptEntries.length} entries → ${transcriptPath}`);
-
-    const transcriptKey = `calls/${callId}/transcript-${callId}.json`;
-    await uploadToS3(transcriptPath, transcriptKey, "application/json", callLogger);
+    callLogger.log(`FILE 1 (transcript) saved locally | ${transcriptEntries.length} entries → ${transcriptPath}`);
   } catch (err) {
     callLogger.error("FILE 1 write failed", err);
     console.error(`[${callId}] ❌ FILE 1 write failed:`, err);
   }
 
-  // Step 4 — FILE 2: agent exchanges (write locally, then upload to S3)
+  // Step 4 — Generate call summary (used for both S3 upload and DynamoDB update)
+  let summary = "No conversation recorded.";
   try {
-    fs.writeFileSync(conversationPath, JSON.stringify(agentExchanges, null, 2));
-    callLogger.log(`FILE 2 saved | ${agentExchanges.length} exchanges → ${conversationPath}`);
+    callLogger.log("Generating call summary...");
+    summary = await generateCallSummary(transcriptEntries, callLogger);
+    callLogger.log(`Generated Summary: "${summary}"`);
+  } catch (err) {
+    callLogger.error("Failed to generate summary", err);
+  }
+
+  // Step 5 — Write and upload conversation log (FILE 2) with summary to S3
+  try {
+    const payload = {
+      summary: summary,
+      conversation: agentExchanges
+    };
+    fs.writeFileSync(conversationPath, JSON.stringify(payload, null, 2));
+    callLogger.log(`FILE 2 (conversation) saved locally with summary | ${agentExchanges.length} exchanges → ${conversationPath}`);
 
     const conversationKey = `calls/${callId}/conversation-${callId}.json`;
     await uploadToS3(conversationPath, conversationKey, "application/json", callLogger);
   } catch (err) {
-    callLogger.error("FILE 2 write failed", err);
-    console.error(`[${callId}] ❌ FILE 2 write failed:`, err);
+    callLogger.error("FILE 2 write/upload failed", err);
+    console.error(`[${callId}] ❌ FILE 2 write/upload failed:`, err);
   }
 
-  // Step 5 — close logger
+  // Step 6 — Upload raw audio files to S3
+  try {
+    const customerKey = `calls/${callId}/audio-${callId}-customer.raw`;
+    await uploadToS3(customerAudioPath, customerKey, "application/octet-stream", callLogger);
+
+    const supportKey = `calls/${callId}/audio-${callId}-support.raw`;
+    await uploadToS3(supportAudioPath, supportKey, "application/octet-stream", callLogger);
+  } catch (err) {
+    callLogger.error("Raw audio files upload failed", err);
+    console.error(`[${callId}] ❌ Raw audio upload failed:`, err);
+  }
+
+  // Step 7 — Update customer profile history in DynamoDB
+  if (customerPhone) {
+    try {
+      if (historyContextPromise) {
+        callLogger.log("Awaiting customer history context lookup to complete...");
+        await historyContextPromise;
+      }
+      await updateCustomerProfile(customerPhone, callId, summary, callLogger);
+    } catch (err) {
+      callLogger.error("DynamoDB profile update failed", err);
+      console.error(`[${callId}] ❌ DynamoDB profile update failed:`, err);
+    }
+
+  }
+
+  // Step 8 — close logger
   callLogger.log("Call finalized.");
   callLogger.end();
 }
@@ -517,7 +696,7 @@ wss.on("connection", (ws, req) => {
 
   const callId = `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
   const customerAudioPath = `${CALLS_DIR}/audio-${callId}-customer.raw`;
-  const agentAudioPath = `${CALLS_DIR}/audio-${callId}-agent.raw`;
+  const supportAudioPath = `${CALLS_DIR}/audio-${callId}-support.raw`;
   const transcriptPath = `${CALLS_DIR}/transcript-${callId}.json`;
   const conversationPath = `${CALLS_DIR}/conversation-${callId}.json`;
 
@@ -525,6 +704,7 @@ wss.on("connection", (ws, req) => {
   const requestUrl = req ? req.url : "/";
   const urlParams = new URL(requestUrl, "http://localhost").searchParams;
   const direction = urlParams.get("direction") || "inbound";
+  const channels = urlParams.get("channels") || "stereo";
 
   // Resolve customer vs support agent track based on call direction
   const customerTrack = direction === "outbound" ? "outbound" : "inbound";
@@ -533,7 +713,7 @@ wss.on("connection", (ws, req) => {
   // Per-session logger — writes to logs/call_<callId>.log
   const callLogger = new CallLogger(callId);
 
-  callLogger.log(`New connection | direction=${direction} | customerTrack=${customerTrack} | agentTrack=${agentTrack}`);
+  callLogger.log(`New connection | direction=${direction} | customerTrack=${customerTrack} | agentTrack=${agentTrack} | channels=${channels}`);
 
   // Ensure CALLS_DIR exists dynamically
   if (!fs.existsSync(CALLS_DIR)) {
@@ -541,7 +721,7 @@ wss.on("connection", (ws, req) => {
   }
 
   const customerAudioFile = fs.createWriteStream(customerAudioPath);
-  const agentAudioFile = fs.createWriteStream(agentAudioPath);
+  const supportAudioFile = fs.createWriteStream(supportAudioPath);
   const transcriptEntries = [];
   const agentExchanges = [];
 
@@ -557,12 +737,64 @@ wss.on("connection", (ws, req) => {
   let transcribeStarted = false;
   let customerTranscribePromise = null;
   let agentTranscribePromise = null;
+  let customerPhone = urlParams.get("customer_phone") || null;
+  let historyContextPromise = null;
+
+  function fetchProfileAndInitializeContext(phone) {
+    return (async () => {
+      try {
+        callLogger.log(`Fetching profile for customer: ${phone}`);
+        const profile = await getCustomerProfile(phone, callLogger);
+        if (profile) {
+          callLogger.log(`Found profile: ${JSON.stringify(profile)}`);
+          const history = profile.CallHistory || [];
+          const lastCalls = history.slice(-3).map(h => `- Call: ${h.CallSid}, Time: ${h.Timestamp}, Summary: ${h.Summary}`).join("\n");
+          console.log(`[${callId}] 👤 Loaded customer: ${profile.CustomerName || "Valued Customer"} (${phone})`);
+          return `Customer Name: ${profile.CustomerName || "Valued Customer"}\nPhone Number: ${phone}\nRecent Call History:\n${lastCalls || "No previous history found."}`;
+        } else {
+          callLogger.log(`No profile found in DynamoDB for ${phone}. Creating a default profile entry...`);
+          try {
+            await docClient.send(new UpdateCommand({
+              TableName: DYNAMODB_TABLE,
+              Key: { PhoneNumber: phone },
+              UpdateExpression: "SET CustomerName = :name, CallHistory = :history",
+              ExpressionAttributeValues: {
+                ":name": "Customer",
+                ":history": []
+              }
+            }));
+            callLogger.log(`Default profile initialized in DynamoDB for ${phone}`);
+          } catch (err) {
+            callLogger.error(`Failed to initialize default profile for ${phone}`, err);
+          }
+          console.log(`[${callId}] 👤 New Customer Detected (${phone})`);
+          return `Customer Name: Customer\nPhone Number: ${phone}\nRecent Call History:\nNo previous history found.`;
+        }
+      } catch (err) {
+        callLogger.error(`fetchProfileAndInitializeContext failed for ${phone}`, err);
+        return "";
+      }
+    })();
+  }
+
+  // If phone was passed in URL query param, start profile load immediately
+  if (customerPhone) {
+    historyContextPromise = fetchProfileAndInitializeContext(customerPhone);
+  }
 
   let _persisted = false;
   const isPersisted = () => _persisted;
   const markPersisted = () => { _persisted = true; };
 
   async function* customerAudioStream() {
+    yield {
+      ConfigurationEvent: {
+        ChannelDefinitions: [
+          { ChannelId: 0, ParticipantRole: "CUSTOMER" },
+          { ChannelId: 1, ParticipantRole: "AGENT" }
+        ]
+      }
+    };
     while (true) {
       if (customerQueue.length > 0) {
         yield { AudioEvent: { AudioChunk: customerQueue.shift() } };
@@ -576,6 +808,14 @@ wss.on("connection", (ws, req) => {
   }
 
   async function* agentAudioStream() {
+    yield {
+      ConfigurationEvent: {
+        ChannelDefinitions: [
+          { ChannelId: 0, ParticipantRole: "AGENT" },
+          { ChannelId: 1, ParticipantRole: "CUSTOMER" }
+        ]
+      }
+    };
     while (true) {
       if (agentQueue.length > 0) {
         yield { AudioEvent: { AudioChunk: agentQueue.shift() } };
@@ -593,7 +833,9 @@ wss.on("connection", (ws, req) => {
     finalizeCall({
       callId,
       customerAudioFile,
-      agentAudioFile,
+      supportAudioFile,
+      customerAudioPath,
+      supportAudioPath,
       customerTranscribePromise,
       agentTranscribePromise,
       transcriptEntries,
@@ -603,13 +845,15 @@ wss.on("connection", (ws, req) => {
       callLogger,
       isPersisted,
       markPersisted,
+      customerPhone,
+      historyContextPromise,
     }).catch((err) => {
       callLogger.error("finalizeCall threw", err);
       console.error(`[${callId}] ❌ finalizeCall threw:`, err);
     });
   }
 
-  ws.on("message", (msg) => {
+  ws.on("message", async (msg) => {
     try {
       const rawText = msg.toString();
       const data = JSON.parse(rawText);
@@ -627,6 +871,19 @@ wss.on("connection", (ws, req) => {
 
         case "start": {
           callLogger.log(`received start event: ${JSON.stringify(data)}`);
+
+          // Option B profile lookup logic
+          const startData = data.start || {};
+          const customParams = startData.custom_parameters || {};
+          const phoneFromStart = customParams.From || customParams.customer_phone || null;
+
+          if (phoneFromStart && phoneFromStart !== customerPhone) {
+            customerPhone = phoneFromStart;
+            historyContextPromise = fetchProfileAndInitializeContext(customerPhone);
+          } else if (customerPhone && !historyContextPromise) {
+            historyContextPromise = fetchProfileAndInitializeContext(customerPhone);
+          }
+
           const mediaFormat = data.start && data.start.media_format;
           const rawRate = mediaFormat && (mediaFormat.sampleRate || mediaFormat.sample_rate);
           const sampleRateHertz = rawRate ? Number(rawRate) : null;
@@ -653,7 +910,8 @@ wss.on("connection", (ws, req) => {
               frozenMeta,
               callId,
               callLogger,
-              "customer"
+              "customer",
+              historyContextPromise
             );
             customerTranscribePromise.catch(() => { });
 
@@ -665,7 +923,8 @@ wss.on("connection", (ws, req) => {
               frozenMeta,
               callId,
               callLogger,
-              "agent"
+              "agent",
+              historyContextPromise
             );
             agentTranscribePromise.catch(() => { });
           }
@@ -673,19 +932,29 @@ wss.on("connection", (ws, req) => {
         }
 
         case "media": {
-          const track = data.media && data.media.track;
           const audioBuffer = Buffer.from(data.media.payload, "base64");
 
-          if (track === customerTrack) {
-            customerAudioFile.write(audioBuffer);
-            customerQueue.push(audioBuffer);
-          } else if (track === agentTrack) {
-            agentAudioFile.write(audioBuffer);
-            agentQueue.push(audioBuffer);
+          if (channels === "stereo") {
+            const { customerBuffer, supportBuffer } = splitStereoBuffer(audioBuffer);
+
+            customerAudioFile.write(customerBuffer);
+            customerQueue.push(customerBuffer);
+
+            supportAudioFile.write(supportBuffer);
+            agentQueue.push(supportBuffer);
           } else {
-            // Default fallback if no track is specified (standard mono streaming test)
-            customerAudioFile.write(audioBuffer);
-            customerQueue.push(audioBuffer);
+            const track = data.media && data.media.track;
+            if (track === customerTrack) {
+              customerAudioFile.write(audioBuffer);
+              customerQueue.push(audioBuffer);
+            } else if (track === agentTrack) {
+              supportAudioFile.write(audioBuffer);
+              agentQueue.push(audioBuffer);
+            } else {
+              // Default fallback if no track is specified (standard mono streaming test)
+              customerAudioFile.write(audioBuffer);
+              customerQueue.push(audioBuffer);
+            }
           }
           break;
         }
