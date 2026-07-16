@@ -640,6 +640,12 @@ async function finalizeCall({
     callLogger.error("Failed to generate summary", err);
   }
 
+  const now = new Date();
+  const yyyy = now.getUTCFullYear();
+  const mm = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(now.getUTCDate()).padStart(2, "0");
+  const partition = `${yyyy}/${mm}/${dd}`;
+
   // Step 5 — Write and upload conversation log (FILE 2) with summary to S3
   try {
     const payload = {
@@ -649,7 +655,7 @@ async function finalizeCall({
     fs.writeFileSync(conversationPath, JSON.stringify(payload, null, 2));
     callLogger.log(`FILE 2 (conversation) saved locally with summary | ${agentExchanges.length} exchanges → ${conversationPath}`);
 
-    const conversationKey = `calls/${callId}/conversation-${callId}.json`;
+    const conversationKey = `${partition}/${callId}/conversation.json`;
     await uploadToS3(conversationPath, conversationKey, "application/json", callLogger);
   } catch (err) {
     callLogger.error("FILE 2 write/upload failed", err);
@@ -658,10 +664,10 @@ async function finalizeCall({
 
   // Step 6 — Upload raw audio files to S3
   try {
-    const customerKey = `calls/${callId}/audio-${callId}-customer.raw`;
+    const customerKey = `${partition}/${callId}/audio-customer.raw`;
     await uploadToS3(customerAudioPath, customerKey, "application/octet-stream", callLogger);
 
-    const supportKey = `calls/${callId}/audio-${callId}-support.raw`;
+    const supportKey = `${partition}/${callId}/audio-support.raw`;
     await uploadToS3(supportAudioPath, supportKey, "application/octet-stream", callLogger);
   } catch (err) {
     callLogger.error("Raw audio files upload failed", err);
