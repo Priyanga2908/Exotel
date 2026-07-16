@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const fs = require("fs");
 const path = require("path");
+const http = require("http");
 const WebSocket = require("ws");
 const {
   TranscribeStreamingClient,
@@ -688,9 +689,19 @@ async function finalizeCall({
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WebSocket Server — each connection fully isolated
-// ─────────────────────────────────────────────────────────────────────────────
-const wss = new WebSocket.Server({ port: PORT });
+// Create HTTP server to handle ALB Health Checks
+const server = http.createServer((req, res) => {
+  if (req.url === "/health" || req.url === "/") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("OK");
+    return;
+  }
+  res.writeHead(404);
+  res.end("Not Found");
+});
+
+// Attach WebSocket server to the HTTP server
+const wss = new WebSocket.Server({ server });
 
 wss.on("connection", (ws, req) => {
 
@@ -985,4 +996,6 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-console.log(`🚀 WebSocket server running on ws://localhost:${PORT} | S3_BUCKET=${S3_BUCKET} | AWS_REGION=${AWS_REGION}`);
+server.listen(PORT, () => {
+  console.log(`🚀 WebSocket & HTTP server running on port ${PORT} | S3_BUCKET=${S3_BUCKET} | AWS_REGION=${AWS_REGION}`);
+});
