@@ -690,10 +690,19 @@ async function finalizeCall({
       callLogger.error("DynamoDB profile update failed", err);
       console.error(`[${callId}] ❌ DynamoDB profile update failed:`, err);
     }
-
   }
 
-  // Step 8 — close logger
+  // Step 8 — Upload complete call log file to S3
+  try {
+    callLogger.log("Uploading full call log file to S3...");
+    const logKey = `${partition}/${callId}/call_${callId}.log`;
+    await uploadToS3(callLogger.filePath, logKey, "text/plain", callLogger);
+  } catch (err) {
+    callLogger.error("Call log S3 upload failed", err);
+    console.error(`[${callId}] ❌ Call log S3 upload failed:`, err);
+  }
+
+  // Step 9 — close logger
   callLogger.log("Call finalized.");
   callLogger.end();
 }
@@ -725,7 +734,7 @@ wss.on("connection", (ws, req) => {
   const requestUrl = req ? req.url : "/";
   const urlParams = new URL(requestUrl, "http://localhost").searchParams;
   const direction = urlParams.get("direction") || "inbound";
-  let channels = urlParams.get("channels") || "mono";
+  let channels = urlParams.get("channels") || "stereo";
 
   // Resolve customer vs support agent track based on call direction
   const customerTrack = direction === "outbound" ? "outbound" : "inbound";
@@ -807,28 +816,44 @@ wss.on("connection", (ws, req) => {
   const isPersisted = () => _persisted;
   const markPersisted = () => { _persisted = true; };
 
+  const SILENCE_CHUNK = Buffer.alloc(3200); // 0.2s of 8000Hz 16-bit mono silence (keep-alive)
+
   async function* customerAudioStream() {
+    let lastAudioTime = Date.now();
     while (true) {
       if (customerQueue.length > 0) {
+        lastAudioTime = Date.now();
         yield { AudioEvent: { AudioChunk: customerQueue.shift() } };
       } else if (streamEnded) {
         callLogger.log("Customer Audio generator exhausted");
         return;
       } else {
-        await new Promise((r) => setTimeout(r, 50));
+        if (Date.now() - lastAudioTime > 3000) {
+          lastAudioTime = Date.now();
+          yield { AudioEvent: { AudioChunk: SILENCE_CHUNK } };
+        } else {
+          await new Promise((r) => setTimeout(r, 50));
+        }
       }
     }
   }
 
   async function* agentAudioStream() {
+    let lastAudioTime = Date.now();
     while (true) {
       if (agentQueue.length > 0) {
+        lastAudioTime = Date.now();
         yield { AudioEvent: { AudioChunk: agentQueue.shift() } };
       } else if (streamEnded) {
         callLogger.log("Agent Audio generator exhausted");
         return;
       } else {
-        await new Promise((r) => setTimeout(r, 50));
+        if (Date.now() - lastAudioTime > 3000) {
+          lastAudioTime = Date.now();
+          yield { AudioEvent: { AudioChunk: SILENCE_CHUNK } };
+        } else {
+          await new Promise((r) => setTimeout(r, 50));
+        }
       }
     }
   }
@@ -902,17 +927,14 @@ wss.on("connection", (ws, req) => {
 
           // Auto-detect channels based on bit rate and test client markers
           const bitRate = mediaFormat && mediaFormat.bit_rate;
-          if (!urlParams.has("channels") && bitRate) {
+          if (!urlParams.has("channels")) {
             const callSid = startData.call_sid || "";
             if (callSid.startsWith("test-")) {
               channels = "mono";
               callLogger.log(`Test client detected (${callSid}) — forcing MONO channel mode`);
-            } else if (bitRate === "128kbps") {
-              channels = "mono";
-              callLogger.log(`Auto-detected MONO channel mode from bit rate: ${bitRate}`);
-            } else if (bitRate === "256kbps") {
+            } else {
               channels = "stereo";
-              callLogger.log(`Auto-detected STEREO channel mode from bit rate: ${bitRate}`);
+              callLogger.log(`Exotel stream detected (${callSid}) — defaulting to STEREO channel mode for speaker separation`);
             }
           }
 
