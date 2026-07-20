@@ -443,6 +443,7 @@ async function startTranscribe(
       }
 
       if (speaker === "agent") {
+        console.log(`[${callId}] [SUPPORT] FINAL (KN): ${kannadaText}`);
         callLogger.log(`[SUPPORT] FINAL (KN): ${kannadaText}`);
       } else {
         console.log(`[${callId}] [CUSTOMER] FINAL (KN): ${kannadaText}`);
@@ -990,15 +991,16 @@ wss.on("connection", (ws, req) => {
             supportAudioFile.write(supportBuffer);
             agentQueue.push(supportBuffer);
           } else {
-            const track = data.media && data.media.track;
-            if (track === customerTrack) {
-              customerAudioFile.write(audioBuffer);
-              customerQueue.push(audioBuffer);
-            } else if (track === agentTrack) {
+            const rawTrack = data.media && data.media.track;
+            const trackStr = rawTrack ? String(rawTrack).toLowerCase() : "";
+
+            if (trackStr.includes("outbound") || trackStr.includes("agent") || trackStr.includes("support")) {
               supportAudioFile.write(audioBuffer);
               agentQueue.push(audioBuffer);
+            } else if (trackStr.includes("inbound") || trackStr.includes("customer")) {
+              customerAudioFile.write(audioBuffer);
+              customerQueue.push(audioBuffer);
             } else {
-              // Default fallback if no track is specified (standard mono streaming test)
               customerAudioFile.write(audioBuffer);
               customerQueue.push(audioBuffer);
             }
