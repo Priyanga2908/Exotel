@@ -6,7 +6,7 @@ const http = require("http");
 const WebSocket = require("ws");
 const {
   TranscribeStreamingClient,
-  StartCallAnalyticsStreamTranscriptionCommand,
+  StartStreamTranscriptionCommand,
 } = require("@aws-sdk/client-transcribe-streaming");
 const {
   BedrockRuntimeClient,
@@ -412,9 +412,9 @@ async function startTranscribe(
     `Transcribe starting for [${speaker.toUpperCase()}] | auto-identify (kn-IN/en-IN) | encoding=${sessionMeta.media_type} | sampleRate=${sampleRateHertz}Hz`
   );
 
-  const command = new StartCallAnalyticsStreamTranscriptionCommand({
+  const command = new StartStreamTranscriptionCommand({
     IdentifyLanguage: true,
-    LanguageOptions: "en-US,es-US",
+    LanguageOptions: "kn-IN,en-IN",
     MediaEncoding: sessionMeta.media_type,
     MediaSampleRateHertz: sampleRateHertz,
     AudioStream: audioStreamGenerator,
@@ -423,132 +423,136 @@ async function startTranscribe(
   const response = await transcribeClient.send(command);
   callLogger.log(`Transcribe stream open for [${speaker.toUpperCase()}]`);
 
-  for await (const event of response.CallAnalyticsTranscriptResultStream) {
-    if (!event.UtteranceEvent) continue;
+  for await (const event of response.TranscriptResultStream) {
+    if (!event.TranscriptEvent) continue;
 
-    const utterance = event.UtteranceEvent;
-    const kannadaText = utterance.Transcript !== undefined ? utterance.Transcript : utterance.transcript;
-    if (!kannadaText || !kannadaText.trim()) {
-      callLogger.log(`Skipping empty/undefined utterance event [${speaker.toUpperCase()}]`);
-      continue;
-    }
-    const languageCode = utterance.LanguageCode !== undefined ? utterance.LanguageCode : (utterance.languageCode || sessionMeta.language);
+    const results = event.TranscriptEvent.Transcript.Results;
+    for (const r of results) {
+      if (r.Alternatives.length === 0) continue;
 
-    if (utterance.IsPartial || utterance.isPartial) {
-      callLogger.log(`partial transcript [${speaker.toUpperCase()}]: ${kannadaText}`);
-      continue;
-    }
+      const kannadaText = r.Alternatives[0].Transcript;
+      if (!kannadaText || !kannadaText.trim()) {
+        callLogger.log(`Skipping empty/undefined transcript event [${speaker.toUpperCase()}]`);
+        continue;
+      }
+      const languageCode = r.LanguageCode || sessionMeta.language;
 
-    console.log(`[${callId}] [${speaker.toUpperCase()}] FINAL (KN): ${kannadaText}`);
-    callLogger.log(`[${speaker.toUpperCase()}] FINAL (KN): ${kannadaText}`);
+      if (r.IsPartial) {
+        callLogger.log(`partial transcript [${speaker.toUpperCase()}]: ${kannadaText}`);
+        continue;
+      }
 
-    if (speaker === "agent") {
-      // Simple translation for Support Agent voice (no Q&A, no filter)
-      callLogger.log(`translating Support Agent speech: "${kannadaText}"`);
-      const translation = await translateText(kannadaText, callLogger);
+      console.log(`[${callId}] [${speaker.toUpperCase()}] FINAL (KN): ${kannadaText}`);
+      callLogger.log(`[${speaker.toUpperCase()}] FINAL (KN): ${kannadaText}`);
 
-      console.log(`[${callId}] [SUPPORT] FINAL (EN): ${translation}`);
-      callLogger.log(`[SUPPORT] FINAL (EN): ${translation}`);
+      if (speaker === "agent") {
+        // Simple translation for Support Agent voice (no Q&A, no filter)
+        callLogger.log(`translating Support Agent speech: "${kannadaText}"`);
+        const translation = await translateText(kannadaText, callLogger);
+
+        console.log(`[${callId}] [SUPPORT] FINAL (EN): ${translation}`);
+        callLogger.log(`[SUPPORT] FINAL (EN): ${translation}`);
+
+        // Store in FILE 1 (transcript)
+        transcriptEntries.push({
+          timestamp: new Date().toISOString(),
+          speaker: "support",
+          language: languageCode,
+          kannada: kannadaText,
+          english: translation,
+          answer: null,
+          media_type: sessionMeta.media_type,
+          sample_rate_hertz: sampleRateHertz,
+        });
+
+        // Store in FILE 2 (conversation)
+        agentExchanges.push({
+          timestamp: new Date().toISOString(),
+          role: "support",
+          text: translation,
+        });
+        continue;
+      }
+
+      // ── CUSTOMER PIPELINE ──
+      // ── STEP 1: Local pre-filter (free, fast) ──
+      const passesLocalFilter = shouldProcessTranscription(kannadaText);
+
+      if (!passesLocalFilter) {
+        // Filler/greeting — store in transcript but skip LLM entirely
+        callLogger.log(`Local filter blocked: "${kannadaText}"`);
+        transcriptEntries.push({
+          timestamp: new Date().toISOString(),
+          speaker: "customer",
+          language: languageCode,
+          kannada: kannadaText,
+          english: null,
+          answer: null,
+          filtered_by: "local",
+          media_type: sessionMeta.media_type,
+          sample_rate_hertz: sampleRateHertz,
+        });
+        continue;
+      }
+
+      // ── STEP 2: Combined translate + topic-match LLM call ──
+      callLogger.log(`sending customer query to translateAndProcessQuery: ${kannadaText}`);
+      const historyContext = historyContextPromise ? await historyContextPromise : "";
+      const result = await translateAndProcessQuery(kannadaText, historyContext, callLogger);
+
+      if (!result) {
+        // LLM call failed — still store raw in transcript
+        callLogger.log(`translateAndProcessQuery returned null for: "${kannadaText}"`);
+        transcriptEntries.push({
+          timestamp: new Date().toISOString(),
+          speaker: "customer",
+          language: languageCode,
+          kannada: kannadaText,
+          english: null,
+          answer: null,
+          filtered_by: "llm_error",
+          media_type: sessionMeta.media_type,
+          sample_rate_hertz: sampleRateHertz,
+        });
+        continue;
+      }
+
+      const { translation, answer } = result;
+      console.log(`[${callId}] [CUSTOMER] FINAL (EN): ${translation}`);
+      callLogger.log(`[CUSTOMER] FINAL (EN): ${translation}`);
 
       // Store in FILE 1 (transcript)
       transcriptEntries.push({
         timestamp: new Date().toISOString(),
-        speaker: "support",
+        speaker: "customer",
         language: languageCode,
         kannada: kannadaText,
         english: translation,
-        answer: null,
+        answer: answer,
         media_type: sessionMeta.media_type,
         sample_rate_hertz: sampleRateHertz,
       });
 
-      // Store in FILE 2 (conversation)
+      // Store in FILE 2 (conversation) - customer statement
       agentExchanges.push({
         timestamp: new Date().toISOString(),
-        role: "support",
+        role: "customer",
         text: translation,
       });
-      continue;
-    }
 
-    // ── CUSTOMER PIPELINE ──
-    // ── STEP 1: Local pre-filter (free, fast) ──
-    const passesLocalFilter = shouldProcessTranscription(kannadaText);
-
-    if (!passesLocalFilter) {
-      // Filler/greeting — store in transcript but skip LLM entirely
-      callLogger.log(`Local filter blocked: "${kannadaText}"`);
-      transcriptEntries.push({
-        timestamp: new Date().toISOString(),
-        speaker: "customer",
-        language: languageCode,
-        kannada: kannadaText,
-        english: null,
-        answer: null,
-        filtered_by: "local",
-        media_type: sessionMeta.media_type,
-        sample_rate_hertz: sampleRateHertz,
-      });
-      continue;
-    }
-
-    // ── STEP 2: Combined translate + topic-match LLM call ──
-    callLogger.log(`sending customer query to translateAndProcessQuery: ${kannadaText}`);
-    const historyContext = historyContextPromise ? await historyContextPromise : "";
-    const result = await translateAndProcessQuery(kannadaText, historyContext, callLogger);
-
-    if (!result) {
-      // LLM call failed — still store raw in transcript
-      callLogger.log(`translateAndProcessQuery returned null for: "${kannadaText}"`);
-      transcriptEntries.push({
-        timestamp: new Date().toISOString(),
-        speaker: "customer",
-        language: languageCode,
-        kannada: kannadaText,
-        english: null,
-        answer: null,
-        filtered_by: "llm_error",
-        media_type: sessionMeta.media_type,
-        sample_rate_hertz: sampleRateHertz,
-      });
-      continue;
-    }
-
-    const { translation, answer } = result;
-    console.log(`[${callId}] [CUSTOMER] FINAL (EN): ${translation}`);
-    callLogger.log(`[CUSTOMER] FINAL (EN): ${translation}`);
-
-    // Store in FILE 1 (transcript)
-    transcriptEntries.push({
-      timestamp: new Date().toISOString(),
-      speaker: "customer",
-      language: languageCode,
-      kannada: kannadaText,
-      english: translation,
-      answer: answer,
-      media_type: sessionMeta.media_type,
-      sample_rate_hertz: sampleRateHertz,
-    });
-
-    // Store in FILE 2 (conversation) - customer statement
-    agentExchanges.push({
-      timestamp: new Date().toISOString(),
-      role: "customer",
-      text: translation,
-    });
-
-    // If answer exists → store in FILE 2 (conversation) - agent response
-    if (answer !== null && answer !== undefined) {
-      console.log(`[${callId}] [AGENT] SUGGESTED ANSWER: ${answer}`);
-      callLogger.log(`[AGENT] SUGGESTED ANSWER: ${answer}`);
-      agentExchanges.push({
-        timestamp: new Date().toISOString(),
-        role: "agent",
-        text: answer,
-      });
-      callLogger.log(`Exchange stored — customer: "${translation}" | agent: "${answer}"`);
-    } else {
-      callLogger.log(`No agent answer (not a support query) — only customer text stored`);
+      // If answer exists → store in FILE 2 (conversation) - agent response
+      if (answer !== null && answer !== undefined) {
+        console.log(`[${callId}] [AGENT] SUGGESTED ANSWER: ${answer}`);
+        callLogger.log(`[AGENT] SUGGESTED ANSWER: ${answer}`);
+        agentExchanges.push({
+          timestamp: new Date().toISOString(),
+          role: "agent",
+          text: answer,
+        });
+        callLogger.log(`Exchange stored — customer: "${translation}" | agent: "${answer}"`);
+      } else {
+        callLogger.log(`No agent answer (not a support query) — only customer text stored`);
+      }
     }
   }
 
@@ -721,7 +725,7 @@ wss.on("connection", (ws, req) => {
   const requestUrl = req ? req.url : "/";
   const urlParams = new URL(requestUrl, "http://localhost").searchParams;
   const direction = urlParams.get("direction") || "inbound";
-  const channels = urlParams.get("channels") || "stereo";
+  let channels = urlParams.get("channels") || "mono";
 
   // Resolve customer vs support agent track based on call direction
   const customerTrack = direction === "outbound" ? "outbound" : "inbound";
@@ -730,7 +734,7 @@ wss.on("connection", (ws, req) => {
   // Per-session logger — writes to logs/call_<callId>.log
   const callLogger = new CallLogger(callId);
 
-  callLogger.log(`New connection | direction=${direction} | customerTrack=${customerTrack} | agentTrack=${agentTrack} | channels=${channels}`);
+  callLogger.log(`New connection | direction=${direction} | customerTrack=${customerTrack} | agentTrack=${agentTrack} | initialChannels=${channels}`);
 
   // Ensure CALLS_DIR exists dynamically
   if (!fs.existsSync(CALLS_DIR)) {
@@ -804,14 +808,6 @@ wss.on("connection", (ws, req) => {
   const markPersisted = () => { _persisted = true; };
 
   async function* customerAudioStream() {
-    yield {
-      ConfigurationEvent: {
-        ChannelDefinitions: [
-          { ChannelId: 0, ParticipantRole: "CUSTOMER" },
-          { ChannelId: 1, ParticipantRole: "AGENT" }
-        ]
-      }
-    };
     while (true) {
       if (customerQueue.length > 0) {
         yield { AudioEvent: { AudioChunk: customerQueue.shift() } };
@@ -825,14 +821,6 @@ wss.on("connection", (ws, req) => {
   }
 
   async function* agentAudioStream() {
-    yield {
-      ConfigurationEvent: {
-        ChannelDefinitions: [
-          { ChannelId: 0, ParticipantRole: "AGENT" },
-          { ChannelId: 1, ParticipantRole: "CUSTOMER" }
-        ]
-      }
-    };
     while (true) {
       if (agentQueue.length > 0) {
         yield { AudioEvent: { AudioChunk: agentQueue.shift() } };
@@ -892,7 +880,7 @@ wss.on("connection", (ws, req) => {
           // Option B profile lookup logic
           const startData = data.start || {};
           const customParams = startData.custom_parameters || {};
-          const phoneFromStart = customParams.From || customParams.customer_phone || null;
+          const phoneFromStart = startData.from || customParams.From || customParams.customer_phone || null;
 
           if (phoneFromStart && phoneFromStart !== customerPhone) {
             customerPhone = phoneFromStart;
@@ -912,7 +900,23 @@ wss.on("connection", (ws, req) => {
             callMeta.sample_rate_hertz = sampleRateHertz;
           }
 
-          callLogger.log(`sampleRateHertz locked: ${callMeta.sample_rate_hertz}Hz`);
+          // Auto-detect channels based on bit rate and test client markers
+          const bitRate = mediaFormat && mediaFormat.bit_rate;
+          if (!urlParams.has("channels") && bitRate) {
+            const callSid = startData.call_sid || "";
+            if (callSid.startsWith("test-")) {
+              channels = "mono";
+              callLogger.log(`Test client detected (${callSid}) — forcing MONO channel mode`);
+            } else if (bitRate === "128kbps") {
+              channels = "mono";
+              callLogger.log(`Auto-detected MONO channel mode from bit rate: ${bitRate}`);
+            } else if (bitRate === "256kbps") {
+              channels = "stereo";
+              callLogger.log(`Auto-detected STEREO channel mode from bit rate: ${bitRate}`);
+            }
+          }
+
+          callLogger.log(`sampleRateHertz locked: ${callMeta.sample_rate_hertz}Hz | channelMode: ${channels}`);
 
           if (!transcribeStarted) {
             transcribeStarted = true;

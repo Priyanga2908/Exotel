@@ -21,6 +21,7 @@ ws.on("open", () => {
     start: {
       stream_sid: "test-stream2",
       call_sid: "test-call-sumanth",
+      from: "+919344705365",
       media_format: {
         encoding: "pcm",
         sample_rate: "8000",
@@ -29,7 +30,7 @@ ws.on("open", () => {
     }
   }));
 
-  const stream = fs.createReadStream("speech02.pcm", {
+  const stream = fs.createReadStream("speech01.pcm", {
     highWaterMark: 3200
   });
 
