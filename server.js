@@ -442,8 +442,12 @@ async function startTranscribe(
         continue;
       }
 
-      console.log(`[${callId}] [${speaker.toUpperCase()}] FINAL (KN): ${kannadaText}`);
-      callLogger.log(`[${speaker.toUpperCase()}] FINAL (KN): ${kannadaText}`);
+      if (speaker === "agent") {
+        callLogger.log(`[SUPPORT] FINAL (KN): ${kannadaText}`);
+      } else {
+        console.log(`[${callId}] [CUSTOMER] FINAL (KN): ${kannadaText}`);
+        callLogger.log(`[CUSTOMER] FINAL (KN): ${kannadaText}`);
+      }
 
       if (speaker === "agent") {
         // Simple translation for Support Agent voice (no Q&A, no filter)
