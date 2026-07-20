@@ -738,7 +738,7 @@ wss.on("connection", (ws, req) => {
   const requestUrl = req ? req.url : "/";
   const urlParams = new URL(requestUrl, "http://localhost").searchParams;
   const direction = urlParams.get("direction") || "inbound";
-  let channels = urlParams.get("channels") || "stereo";
+  let channels = urlParams.get("channels") || "mono";
 
   // Resolve customer vs support agent track based on call direction
   const customerTrack = direction === "outbound" ? "outbound" : "inbound";
@@ -931,15 +931,15 @@ wss.on("connection", (ws, req) => {
 
           // Auto-detect channels based on bit rate and test client markers
           const bitRate = mediaFormat && mediaFormat.bit_rate;
-          if (!urlParams.has("channels")) {
-            const callSid = startData.call_sid || "";
-            if (callSid.startsWith("test-")) {
-              channels = "mono";
-              callLogger.log(`Test client detected (${callSid}) — forcing MONO channel mode`);
-            } else {
-              channels = "stereo";
-              callLogger.log(`Exotel stream detected (${callSid}) — defaulting to STEREO channel mode for speaker separation`);
-            }
+          if (urlParams.has("channels")) {
+            channels = urlParams.get("channels");
+            callLogger.log(`Channel mode explicitly set via URL: ${channels}`);
+          } else if (bitRate === "256kbps") {
+            channels = "stereo";
+            callLogger.log(`256kbps dual-channel stream detected — using STEREO splitting mode`);
+          } else {
+            channels = "mono";
+            callLogger.log(`128kbps stream detected — using MONO track-routing mode (inbound/outbound)`);
           }
 
           callLogger.log(`sampleRateHertz locked: ${callMeta.sample_rate_hertz}Hz | channelMode: ${channels}`);
