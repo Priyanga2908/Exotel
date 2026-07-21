@@ -294,12 +294,12 @@ Your task is to perform two steps:
    - Topic 9: Refund Request (e.g. refund status, refund policy, money back) -> Answer: "Refund requests are processed within 5-7 working days after validation by our billing team."
    - Topic 10: New Ticket (e.g. raise a new ticket, file a new complaint) -> Answer: "I would be happy to raise a new ticket for you. The ticket number is #EX89230."
 
-    Rules:
-    - The "translation" field must contain ONLY the literal, accurate English translation of the input text.
-    - If the translated text is NOT a customer support query or question (e.g., greetings, introducing oneself, or general statements like "I came to the office today", "I am in the office", "Hello sir, my name is Shanti"), the "answer" field MUST be null.
-    - If the translated text contains an actual customer support query or question:
-      * If it relates to any of the 10 topics above, return the exact Answer specified.
-      * If it does NOT relate to any of the 10 topics above, return: "We will check into it. Later The support team will contact you."
+Rules:
+- The "translation" field must contain ONLY the literal, accurate English translation of the input text.
+- If the translated text is NOT a customer support query or question (e.g., greetings, introducing oneself, or general statements like "I came to the office today", "I am in the office", "Hello sir, my name is Shanti"), the "answer" field MUST be null.
+- If the translated text contains an actual customer support query or question:
+  * If it relates to any of the 10 topics above, return the exact Answer specified.
+  * If it does NOT relate to any of the 10 topics above, return: "We will check into it. Later The support team will contact you."
 
 Respond ONLY with a JSON object containing the keys "translation" and "answer". Do not include any formatting, markdown wrappers, backticks, or explanation.
 
@@ -982,7 +982,14 @@ wss.on("connection", (ws, req) => {
         case "media": {
           const audioBuffer = Buffer.from(data.media.payload, "base64");
 
-          if (channels === "stereo") {
+          const speakerParam = urlParams.get("speaker");
+          if (speakerParam === "agent" || speakerParam === "support") {
+            supportAudioFile.write(audioBuffer);
+            agentQueue.push(audioBuffer);
+          } else if (speakerParam === "customer") {
+            customerAudioFile.write(audioBuffer);
+            customerQueue.push(audioBuffer);
+          } else if (channels === "stereo") {
             const { customerBuffer, supportBuffer } = splitStereoBuffer(audioBuffer);
 
             customerAudioFile.write(customerBuffer);
@@ -994,12 +1001,16 @@ wss.on("connection", (ws, req) => {
             const rawTrack = data.media && data.media.track;
             const trackStr = rawTrack ? String(rawTrack).toLowerCase() : "";
 
+            if (!ws._seenTracks) ws._seenTracks = new Set();
+            if (!ws._seenTracks.has(trackStr)) {
+              ws._seenTracks.add(trackStr);
+              console.log(`[${callId}] 📡 Exotel Audio Track Detected: "${rawTrack}"`);
+              callLogger.log(`Exotel Audio Track Detected: "${rawTrack}"`);
+            }
+
             if (trackStr.includes("outbound") || trackStr.includes("agent") || trackStr.includes("support")) {
               supportAudioFile.write(audioBuffer);
               agentQueue.push(audioBuffer);
-            } else if (trackStr.includes("inbound") || trackStr.includes("customer")) {
-              customerAudioFile.write(audioBuffer);
-              customerQueue.push(audioBuffer);
             } else {
               customerAudioFile.write(audioBuffer);
               customerQueue.push(audioBuffer);
